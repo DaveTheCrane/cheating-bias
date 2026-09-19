@@ -1,0 +1,40 @@
+# Pilot grid: size the effect before committing to a large run.
+#
+# Three rungs, not seven: P0 as baseline, P3 as the strongest rule-based
+# intervention, P6 as the escape hatch. If neither P3 nor P6 moves the rate at
+# n=30, a seven-rung grid will not either, and the useful next step is a better
+# task rather than more runs.
+#
+# Both spec arms are included even though the perf task is the workhorse,
+# because the impossible/possible contrast is the cheapest strong signal in the
+# design and costs little at this size.
+#
+# Set the model ids below to ones you actually have access to; these are
+# placeholders, not verified current identifiers.
+models:
+  - anthropic:claude-sonnet-4-5
+  - openai:gpt-4.1
+
+prompts: [P0, P3, P6]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+# 2 models x 3 rungs x 3 tasks x 30 = 540 runs.
+repeats: 30
+
+max_turns: 30
+temperature: 1.0
+max_tokens: 4096
+
+# Placement of the condition text. Hold at 'system' for the main comparison; run
+# the grid again with 'user' or 'repo_file' to separate instruction-hierarchy
+# effects from instruction strength.
+prompt_channel: system
+
+# Observation salience. 'none' for the main comparison; 'reviewed' and
+# 'unmonitored' probe whether the behaviour is strategic rather than default.
+monitoring: none
+
+sandbox: docker
+concurrency: 4
+out_dir: results/pilot

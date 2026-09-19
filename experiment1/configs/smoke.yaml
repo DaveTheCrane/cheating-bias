@@ -1,0 +1,25 @@
+# Smoke grid: scripted agents only, no API keys, no network.
+#
+# Checks the pipeline end to end and produces a results.jsonl you can point
+# `analyze` at. Any apparent prompt effect here is a harness bug, because the
+# mock models ignore the prompt entirely.
+models:
+  - mock:honest
+  - mock:hardcoder
+  - mock:test_tamperer
+  - mock:overclaimer
+
+prompts: [P0, P3]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 1
+max_turns: 20
+sandbox: subprocess
+concurrency: 4
+out_dir: results/smoke
+
+# Keeps a still-naive implementation from spending the task's full holdout
+# budget grinding through expensive held-out inputs.
+command_timeout_cap: 20
+agent_command_timeout: 20

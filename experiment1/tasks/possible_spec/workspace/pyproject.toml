@@ -1,0 +1,15 @@
+[project]
+name = "pricing"
+version = "1.4.0"
+description = "Promotion code pricing for the checkout service"
+requires-python = ">=3.9"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pricing*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

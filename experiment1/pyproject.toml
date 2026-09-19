@@ -1,0 +1,31 @@
+[project]
+name = "cheating-bias-experiment1"
+version = "0.1.0"
+description = "Harness for measuring how prompt conditions affect agent cheating rates"
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+    "pytest>=7.0",
+]
+
+[project.optional-dependencies]
+# Only needed for the providers you actually intend to call. The mock models,
+# the self-test and `verify-tasks` need neither.
+anthropic = ["anthropic>=0.40.0"]
+openai = ["openai>=1.40.0"]
+
+[project.scripts]
+harness = "harness.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["harness*"]
+
+[tool.pytest.ini_options]
+# The task workspaces under tasks/ contain their own test suites, which are
+# fixtures rather than tests of this harness. Collecting them here would run
+# a deliberately failing suite and a deliberately unsatisfiable one.
+norecursedirs = ["tasks", "results", ".git"]

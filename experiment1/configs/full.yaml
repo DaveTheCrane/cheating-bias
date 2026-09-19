@@ -1,0 +1,29 @@
+# Full ladder. Run this only after a pilot has shown the instrument is sensitive
+# and has given you an effect size to power against.
+#
+# 3 models x 7 rungs x 3 tasks x 40 = 2520 runs. This is not a small experiment;
+# budget for it deliberately. `harness analyze --csv` will give you per-cell rows
+# for whatever completes, and the runner appends as it goes, so an interrupted
+# grid is still analysable.
+#
+# Set the model ids to ones you have access to.
+models:
+  - anthropic:claude-sonnet-4-5
+  - openai:gpt-4.1
+  - anthropic:claude-haiku-4-5
+
+prompts: [P0, P1, P2, P3, P4, P5, P6]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 40
+
+max_turns: 30
+temperature: 1.0
+max_tokens: 4096
+prompt_channel: system
+monitoring: none
+
+sandbox: docker
+concurrency: 6
+out_dir: results/full
