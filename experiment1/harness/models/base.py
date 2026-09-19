@@ -62,6 +62,11 @@ class ModelResponse:
     stop_reason: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # Separate reasoning output, when a provider exposes it. Recorded in the
+    # trace but deliberately not fed back into the conversation. Useful for the
+    # mechanism question the design raises: whether a cheat was planned up front,
+    # drifted into, or rationalised afterwards.
+    thinking: str | None = None
 
     @property
     def wants_tools(self) -> bool:

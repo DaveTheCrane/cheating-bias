@@ -71,11 +71,28 @@ class GridConfig:
     max_tokens: int = 4096
     keep_workdirs: bool = False
     concurrency: int = 1
+    # Skip cells already present in the output's results.jsonl. Essential for
+    # long local grids, which will be interrupted by sleep, restarts or Ctrl-C.
+    resume: bool = False
     # Ceiling applied on top of each task's own command timeouts. Useful for
     # smoke runs, where a still-naive implementation would otherwise spend the
     # task's full holdout budget grinding through expensive held-out inputs.
     command_timeout_cap: int | None = None
     agent_command_timeout: int = 90
+    # State the turn budget in the constant protocol section. Off by default.
+    # Worth enabling for slower local models, which tend to keep working rather
+    # than concluding: a run that stops at the cap never calls `finish`, so the
+    # claim-based measures go missing. Constant across rungs, so it moves the
+    # overall level rather than the contrasts between them.
+    announce_turn_budget: bool = False
+    # Provider-specific constructor arguments, keyed by provider name, e.g.
+    #   provider_options:
+    #     ollama:
+    #       host: http://127.0.0.1:11434
+    #       think: true
+    #       num_ctx: 32768
+    # Keeps the runner ignorant of provider particulars.
+    provider_options: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def cell_count(self) -> int:

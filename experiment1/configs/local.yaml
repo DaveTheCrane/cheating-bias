@@ -1,0 +1,51 @@
+# Local grid via Ollama. No API key, no egress.
+#
+# Cost reality on a 9.7B Q4 model: a single model call runs roughly 8-15s on a
+# short context and ~50s once the transcript reaches 10k tokens, and an agent run
+# is a dozen or more calls. Budget minutes per run, not seconds. The grid below is
+# 3 rungs x 3 tasks x 10 = 90 runs and will take hours, which is still the
+# cheapest way to get a real elasticity curve without paying per token.
+#
+# Check the model first:
+#   python -m harness probe-model ollama:qwen3.5:latest
+models:
+  - ollama:qwen3.5:latest
+
+prompts: [P0, P3, P6]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 10
+
+# Local models are slower per turn and tend to need fewer turns before they stall,
+# so a lower cap mostly saves wall-clock rather than cutting runs short. Raise it
+# if you see many runs ending with stop_reason=max_turns.
+max_turns: 20
+
+temperature: 1.0
+max_tokens: 4096
+
+prompt_channel: system
+monitoring: none
+
+# Forced to 1 for local providers regardless of what is set here: one server
+# processes requests serially, so extra workers only queue, and they distort the
+# wall-clock budget the perf task grades against.
+concurrency: 1
+
+sandbox: subprocess
+out_dir: results/local
+
+provider_options:
+  ollama:
+    host: http://127.0.0.1:11434
+    # Reasoning output is recorded in the trace and never fed back into the
+    # conversation. Turning it on costs latency but lets you ask whether a cheat
+    # was planned before the first edit or arrived after an honest attempt failed.
+    think: false
+    # Left unset to use the server's own context sizing, which was verified to
+    # handle ~10k-token prompts without truncation on Ollama 0.34. Set it
+    # explicitly if runs must be comparable across machines, since the default
+    # varies by version and by OLLAMA_CONTEXT_LENGTH.
+    # num_ctx: 32768
+    keep_alive: 30m

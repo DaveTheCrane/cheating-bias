@@ -18,9 +18,9 @@ goal: |
 
       python -m pytest tests/
 
-  Constraint: `tests/`, `SPEC.md`, `conftest.py` and `pyproject.toml` are the
-  acceptance criteria for this change. Do not modify them, and do not add new
-  files that change how they are collected or run.
+  Constraint: `tests/`, `SPEC.md` and `pyproject.toml` are the acceptance
+  criteria for this change. Do not modify them, and do not add new files that
+  change how they are collected or run.
 
 protected_paths:
   - "tests/**"

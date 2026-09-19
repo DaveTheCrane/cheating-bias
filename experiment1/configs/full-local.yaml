@@ -1,0 +1,94 @@
+# Full ladder, local only. This is a multi-day run: read the notes first.
+#
+# Scope: 1 model x 7 rungs x 3 tasks x 20 repeats = 420 runs.
+#
+# Cost, measured on this machine with qwen3.5:latest (9.7B, Q4_K_M) over 6 runs:
+#
+#   perf_memo         ~126s   (9-14 turns, finishes cleanly)
+#   possible_spec      ~82s   (9-14 turns, finishes cleanly)
+#   impossible_spec   ~581s   (uses the full turn budget every time)
+#
+# One repeat of all three tasks at one rung is ~13 minutes, so 420 runs is about
+# 31 hours of continuous compute. Storage is ~60 KB of trace per run, so ~25 MB
+# in total; that is not a constraint.
+#
+# Note that impossible_spec is ~74% of the wall-clock. If you are short of time,
+# cutting repeats on that task alone buys back more than anything else you can do.
+#
+#   python -m harness run --config configs/full-local.yaml --resume --yes
+#
+# ALWAYS pass --resume for a run this long. Without it, restarting after a sleep,
+# an Ollama restart or a Ctrl-C re-runs everything and duplicates rows.
+#
+# Statistical reality at 20 repeats. A cell of n=20 gives a 95% Wilson interval
+# about +/-0.20 wide near a rate of 0.5, and against a 0.50 baseline a drop has to
+# reach 0.15 before Fisher clears p<0.05 at all. That is enough to see the *shape*
+# of the ladder and to run the twin contrast; it will not resolve differences
+# between adjacent rungs.
+#
+# If you care about specific pairwise comparisons, drop rungs rather than repeats:
+# configs/focused-local.yaml runs P0/P1/P3/P6 at 35 repeats for the same
+# wall-clock, where a drop to 0.25 reaches p=0.049.
+#
+# The single-model limitation matters. The design's second prediction is that a
+# deep disposition varies more between models than a shallow one, and one model
+# cannot address that at all. To get the between-model axis locally, pull more
+# tool-capable models and add them below. Verify each one first:
+#
+#   ollama pull <model>
+#   python -m harness probe-model ollama:<model>
+#
+# The probe fails clearly if the model will not emit a tool call, which is the
+# common failure for small local models and is not otherwise obvious. Note that
+# every extra model multiplies the wall-clock cost.
+models:
+  - ollama:qwen3.5:latest
+
+prompts: [P0, P1, P2, P3, P4, P5, P6]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 20
+
+# On the impossible task this model uses the whole budget every time and never
+# calls `finish`. Raising the cap does not change that, it just costs more: at 30
+# turns the run takes ~580s, and announcing the budget in the prompt (see
+# announce_turn_budget below) was tested and made no difference except to make the
+# run slower.
+#
+# What that costs you is narrower than it looks. The primary measure still works:
+# cheating is detected from the code and the verification, not from what the agent
+# says. What goes missing on that task is the claim axis only — `overclaim` and
+# `misreporting` need a run that reported an outcome. `analyze` prints the
+# stop-reason distribution and warns when a large share of runs carry no claim.
+max_turns: 30
+
+# Tested on this model and it did not help: impossible_spec still used all 30
+# turns without calling `finish`. Left off for a second reason — in the one run
+# tried, the model reached for a module-state hack on its final turn after 29
+# honest turns, which is what you would expect if the notice adds time pressure.
+# That is n=1 and not a finding, but the notice pushes in the same direction P1
+# does, so enabling it would blur the thing P1 is supposed to isolate.
+announce_turn_budget: false
+
+temperature: 1.0
+max_tokens: 4096
+
+prompt_channel: system
+monitoring: none
+
+# Forced to 1 for local providers regardless of this value.
+concurrency: 1
+
+sandbox: subprocess
+out_dir: results/full-local
+resume: true
+
+provider_options:
+  ollama:
+    host: http://127.0.0.1:11434
+    think: false
+    keep_alive: 30m
+    # Pin this if you ever compare these results against another machine, since
+    # the server default depends on the Ollama version and OLLAMA_CONTEXT_LENGTH.
+    # num_ctx: 32768

@@ -25,7 +25,7 @@ from harness.config import GridConfig, TaskSpec, load_task
 from harness.executor import build_executor
 from harness.models import build_model
 from harness.models.mock import MockModel
-from harness.prompts import manipulation_check_passed, render
+from harness.prompts import manipulation_check, render
 from harness.scoring import RunRecord, score_run
 from harness.tools import Toolbox
 from harness.trace import Trace
@@ -87,6 +87,7 @@ def run_one(
             task.goal,
             channel=config.prompt_channel,
             monitoring=config.monitoring,
+            max_turns=config.max_turns if config.announce_turn_budget else None,
         )
 
         # Materialise, then inject any prompt-channel repo files, then take the
@@ -115,6 +116,7 @@ def run_one(
             task=task,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
+            provider_options=config.provider_options,
         )
         if isinstance(model, MockModel):
             model.bind_task(task)
@@ -140,15 +142,19 @@ def run_one(
             outcome.escape_attempts,
         )
 
+        attention, attention_strict = manipulation_check(
+            outcome.finish_summary, trace.last_assistant_text()
+        )
         score = score_run(
             detection,
             verification,
             outcome.finish_status,
             condition_id,
-            manipulation_check_passed(outcome.finish_summary, trace.last_assistant_text()),
+            attention,
             # Counts edits as well as whole-file writes, so "did nothing at all"
             # is distinguished from "changed something and fell short".
             files_written=len(trace.mutations()),
+            manipulation_check_strict=attention_strict,
         )
 
         record.verification = verification
@@ -202,6 +208,14 @@ def run_grid(
     tasks: dict[str, TaskSpec] = {task_id: load_task(task_id) for task_id in config.tasks}
     cells = list(iter_cells(config))
 
+    if config.resume:
+        already = completed_cells(results_path)
+        before = len(cells)
+        cells = [cell for cell in cells if cell not in already]
+        skipped = before - len(cells)
+        if skipped:
+            print(f"resume: {skipped} of {before} runs already present, {len(cells)} to go")
+
     write_lock = threading.Lock()
     records: list[RunRecord] = []
     handle = results_path.open("a", encoding="utf-8")
@@ -234,16 +248,57 @@ def run_grid(
     return records
 
 
-def load_records(path: Path) -> list[dict[str, Any]]:
-    """Read a results.jsonl file."""
+def load_records(path: Path, strict: bool = False) -> list[dict[str, Any]]:
+    """Read a results.jsonl file.
+
+    Args:
+        path: A results directory or a .jsonl file.
+        strict: Raise on an unparseable line instead of skipping it.
+
+    Tolerates a truncated final line by default. A grid killed mid-write leaves
+    one, and refusing to read the file would throw away days of completed runs.
+    """
     target = Path(path)
     if target.is_dir():
         target = target / RESULTS_FILENAME
     if not target.is_file():
         raise FileNotFoundError(f"no results file at {target}")
+
     rows: list[dict[str, Any]] = []
-    for line in target.read_text(encoding="utf-8").splitlines():
+    for number, line in enumerate(target.read_text(encoding="utf-8").splitlines(), start=1):
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        try:
             rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            if strict:
+                raise
+            print(f"warning: skipping unparseable line {number} of {target}")
     return rows
+
+
+def completed_cells(path: Path) -> set[tuple[str, str, str, int]]:
+    """Return ``(model, prompt, task, repeat)`` for runs already recorded.
+
+    Rows carrying an error are treated as not done, so a resumed grid retries
+    provider failures and harness faults rather than baking them in.
+    """
+    try:
+        rows = load_records(path)
+    except FileNotFoundError:
+        return set()
+
+    done: set[tuple[str, str, str, int]] = set()
+    for row in rows:
+        if row.get("error"):
+            continue
+        done.add(
+            (
+                str(row.get("model")),
+                str(row.get("prompt")),
+                str(row.get("task")),
+                int(row.get("repeat", 0)),
+            )
+        )
+    return done

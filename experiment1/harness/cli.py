@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from harness import analyze, verify
@@ -25,10 +27,29 @@ from harness.config import (
     load_task,
 )
 from harness.executor import build_executor
+from harness.models import PROVIDERS, is_local, parse_spec, requires_credentials
 from harness.models.mock import PERSONALITIES
 from harness.prompts import LADDER, MONITORING, CHANNELS, render
-from harness.runner import RESULTS_FILENAME, load_records, run_grid
+from harness.runner import (
+    RESULTS_FILENAME,
+    completed_cells,
+    iter_cells,
+    load_records,
+    run_grid,
+)
 from harness.scoring import RunRecord
+
+
+def _duration(seconds: float) -> str:
+    """Render a rough duration for progress output."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 SANDBOX_WARNING = (
     "!! Running agent-written code. The 'subprocess' backend is process isolation\n"
@@ -59,6 +80,11 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-turns", type=int, help="cap on model calls per run")
     run.add_argument("--keep-workdirs", action="store_true", help="do not delete run workdirs")
     run.add_argument("--yes", action="store_true", help="skip the sandbox confirmation prompt")
+    run.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip cells already recorded in the output directory",
+    )
 
     analyse = sub.add_parser("analyze", help="summarise a results directory")
     analyse.add_argument("path", nargs="?", default="results", help="results dir or jsonl file")
@@ -70,6 +96,13 @@ def _build_parser() -> argparse.ArgumentParser:
     self_test = sub.add_parser("selftest", help="validate the detectors against scripted agents")
     self_test.add_argument("--workers", type=int, default=4, help="parallel runs")
     self_test.add_argument("--keep", action="store_true", help="keep artifacts for inspection")
+
+    probe = sub.add_parser(
+        "probe-model",
+        help="check that a model spec is reachable and will actually call a tool",
+    )
+    probe.add_argument("spec", help="e.g. ollama:qwen3.5:latest")
+    probe.add_argument("--host", help="override the Ollama host")
 
     sub.add_parser("list", help="list tasks, prompt rungs and mock personalities")
 
@@ -108,6 +141,8 @@ def _grid_from_args(args: argparse.Namespace) -> GridConfig:
             setattr(config, attribute, value)
     if args.keep_workdirs:
         config.keep_workdirs = True
+    if getattr(args, "resume", False):
+        config.resume = True
 
     unknown_prompts = [p for p in config.prompts if p not in LADDER]
     if unknown_prompts:
@@ -115,6 +150,9 @@ def _grid_from_args(args: argparse.Namespace) -> GridConfig:
     unknown_tasks = [t for t in config.tasks if t not in available_tasks()]
     if unknown_tasks:
         raise SystemExit(f"unknown tasks {unknown_tasks}; have {available_tasks()}")
+
+    for spec in config.models:
+        parse_spec(spec)  # fail fast on a typo rather than 300 runs in
 
     return config
 
@@ -129,6 +167,47 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     print(f"sandbox: {config.sandbox}   out: {config.out_dir}")
 
+    local = [spec for spec in config.models if is_local(spec)]
+    if local and config.concurrency > 1:
+        # A local server processes requests serially by default, so extra workers
+        # only queue and compete for memory. Worse, they inflate wall-clock
+        # timings, and the perf task grades against a wall-clock budget.
+        print(
+            f"note: {', '.join(local)} is served locally; forcing concurrency "
+            f"{config.concurrency} -> 1. Parallel workers would queue on the same "
+            f"server and distort the wall-clock budget the perf task measures."
+        )
+        config.concurrency = 1
+
+    # A fixed seed plus repeats > 1 produces identical runs, which silently turns
+    # n repeats into n copies of one observation and makes every interval a lie.
+    seeded = [
+        name
+        for name, options in (config.provider_options or {}).items()
+        if options.get("seed") is not None
+    ]
+    if seeded and config.repeats > 1:
+        print(
+            f"warning: provider_options.{seeded[0]}.seed is set and repeats="
+            f"{config.repeats}. A fixed seed makes every repeat identical, so the "
+            f"cell would hold one observation counted {config.repeats} times. Remove "
+            f"the seed for a grid; keep it only for reproducing a single run."
+        )
+
+    missing = sorted(
+        {
+            parse_spec(spec)[0]
+            for spec in config.models
+            if requires_credentials(spec)
+            and not os.environ.get(f"{parse_spec(spec)[0].upper()}_API_KEY")
+        }
+    )
+    if missing:
+        print(
+            "warning: no API key in the environment for: "
+            + ", ".join(f"{name} ({name.upper()}_API_KEY)" for name in missing)
+        )
+
     if config.sandbox == "subprocess":
         print(SANDBOX_WARNING)
         real_models = [m for m in config.models if not m.startswith("mock:")]
@@ -137,18 +216,41 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if reply not in ("y", "yes"):
                 return 1
 
-    completed = 0
     total = config.run_count
+    if config.resume:
+        done = completed_cells(Path(config.out_dir) / RESULTS_FILENAME)
+        remaining = [cell for cell in iter_cells(config) if cell not in done]
+        total = len(remaining)
+        print(f"resume: {len(done)} run(s) already recorded, {total} remaining")
+        if total == 0:
+            print("nothing to do")
+            return 0
+
+    completed = 0
+    started_at = time.time()
 
     def progress(record: RunRecord) -> None:
         nonlocal completed
         completed += 1
         score = record.score or {}
         state = "ERROR" if record.error else ("CHEAT" if score.get("cheated") else "clean")
+
+        # A local grid runs for hours, so show where it is going. Based on the
+        # mean so far, which is adequate once a handful of runs are in.
+        elapsed = time.time() - started_at
+        eta = ""
+        if completed >= 3 and completed < total:
+            remaining_secs = (elapsed / completed) * (total - completed)
+            eta = f"  eta {_duration(remaining_secs)}"
+
         print(
             f"[{completed:>4}/{total}] {record.model:<28}{record.prompt:<4}"
             f"{record.task:<16}{state:<6}{record.duration:>7.1f}s"
-            f"  {','.join(score.get('channels') or []) or '-'}"
+            f"  {','.join(score.get('channels') or []) or '-'}{eta}",
+            # Without this, redirecting or piping a long run shows nothing for
+            # many minutes at a time: Python block-buffers stdout when it is not
+            # a terminal, and these lines are the only sign of progress.
+            flush=True,
         )
 
     records = run_grid(config, Path(config.out_dir), on_record=progress)
@@ -252,6 +354,58 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _cmd_probe_model(args: argparse.Namespace) -> int:
+    """One-shot reachability and tool-calling check for a model spec.
+
+    Worth running before any grid. A model that cannot or will not emit a tool
+    call produces runs that look like total task failure, which is easy to
+    misread as a capability result rather than a plumbing problem.
+    """
+    provider, model_id = parse_spec(args.spec)
+
+    if provider == "mock":
+        print(f"{args.spec}: mock models need no probe; run `harness selftest`.")
+        return 0
+
+    if provider != "ollama":
+        key = f"{provider.upper()}_API_KEY"
+        state = "present" if os.environ.get(key) else "MISSING"
+        print(f"{args.spec}: hosted provider, {key} {state}")
+        print("no live probe implemented for hosted providers; run a single-cell grid instead:")
+        print(
+            f"  python -m harness run --models {args.spec} --prompts P0 "
+            f"--tasks perf_memo --repeats 1"
+        )
+        return 0 if os.environ.get(key) else 1
+
+    from harness.models.ollama_model import probe
+
+    print(f"probing {args.spec} ...")
+    report = probe(model_id, host=args.host)
+
+    print(f"  host          {report['host']}")
+    print(f"  reachable     {'yes' if not report['error'] else 'NO'}")
+    if report["error"]:
+        print(f"  error         {report['error']}")
+    print(f"  latency       {report['elapsed_secs']}s")
+    print(f"  tool call     {report['tool_calls'] or 'NONE - model did not call the tool'}")
+    if report["text"]:
+        print(f"  text          {report['text']!r}")
+    usage = report.get("usage") or {}
+    if usage.get("input_tokens"):
+        print(f"  tokens        in={usage.get('input_tokens')} out={usage.get('output_tokens')}")
+
+    if report["ok"]:
+        print("\nok: the model is reachable and emitted a well-formed tool call")
+        return 0
+
+    print(
+        "\nFAILED: this spec is not usable for the experiment. The tasks require a "
+        "tool-calling model; check `ollama show <model>` for a 'tools' capability."
+    )
+    return 1
+
+
 def _cmd_list(_args: argparse.Namespace) -> int:
     print("tasks")
     for task_id in available_tasks():
@@ -266,6 +420,13 @@ def _cmd_list(_args: argparse.Namespace) -> int:
 
     print("\nmock personalities")
     print("  " + ", ".join(PERSONALITIES))
+
+    print("\nmodel providers")
+    print("  mock:<personality>        scripted, offline, used by selftest")
+    print("  anthropic:<model-id>      needs ANTHROPIC_API_KEY")
+    print("  openai:<model-id>         needs OPENAI_API_KEY")
+    print("  ollama:<model>:<tag>      local, no key; e.g. ollama:qwen3.5:latest")
+    print(f"  (known providers: {', '.join(PROVIDERS)})")
 
     print("\nprompt channels:  " + ", ".join(CHANNELS))
     print("monitoring levels: " + ", ".join(sorted(MONITORING)))
@@ -304,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         "analyze": _cmd_analyze,
         "verify-tasks": _cmd_verify_tasks,
         "selftest": _cmd_selftest,
+        "probe-model": _cmd_probe_model,
         "list": _cmd_list,
         "show-prompt": _cmd_show_prompt,
     }

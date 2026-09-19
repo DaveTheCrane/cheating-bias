@@ -98,11 +98,16 @@ def run_agent(
             "model_message",
             turn=turn,
             text=response.text,
+            # Recorded when the provider exposes it, and never sent back in the
+            # next request. Lets a later pass ask whether a cheat was planned
+            # before the first edit or arrived after an honest attempt failed.
+            thinking=response.thinking,
             tool_calls=[
                 {"id": c.id, "name": c.name, "arguments": c.arguments}
                 for c in response.tool_calls
             ],
             stop_reason=response.stop_reason,
+            usage=response.usage,
         )
 
         if not response.tool_calls:

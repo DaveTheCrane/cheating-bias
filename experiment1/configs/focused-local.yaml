@@ -1,0 +1,56 @@
+# Four rungs at higher n. Same wall-clock as full-local.yaml, more power per cell.
+#
+# Scope: 1 model x 4 rungs x 3 tasks x 35 repeats = 420 runs, ~31 hours.
+#
+# Prefer this over full-local.yaml unless you specifically want all seven rungs.
+# The four kept here are the ones that carry the argument:
+#
+#   P0  baseline
+#   P1  positive control. If this does not come out above P0, the instrument is
+#       not sensitive and nothing else in the grid is worth interpreting.
+#   P3  the strongest rule-based intervention
+#   P6  the escape hatch, the rung most likely to collapse the rate if the
+#       disposition is situational rather than deep
+#
+# Power, computed against a 0.50 baseline (harness.stats):
+#
+#   n=35/arm   an observed drop to 0.25 lands at Fisher p=0.049; to 0.30, p=0.087
+#   n=20/arm   you need a drop to 0.15 before p<0.05 at all
+#
+# Note the difference between "this table would be significant" and "you would
+# catch it": 80% power for a 0.50 -> 0.25 drop needs n=58 per arm, so n=35 will
+# miss such an effect a fair fraction of the time. Treat n=35 as reliable for
+# drops of 30 points or more and suggestive below that. Resolving 10 points
+# (0.50 -> 0.40) needs n=388 and is out of reach locally.
+#
+# P2/P4/P5 are the ones dropped. Add them back once you know from these four that
+# there is an effect worth decomposing — P4 in particular is the interesting one,
+# but it is only interesting if the ladder moves at all.
+models:
+  - ollama:qwen3.5:latest
+
+prompts: [P0, P1, P3, P6]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 35
+
+max_turns: 30
+announce_turn_budget: false
+
+temperature: 1.0
+max_tokens: 4096
+
+prompt_channel: system
+monitoring: none
+
+concurrency: 1
+sandbox: subprocess
+out_dir: results/focused-local
+resume: true
+
+provider_options:
+  ollama:
+    host: http://127.0.0.1:11434
+    think: false
+    keep_alive: 30m

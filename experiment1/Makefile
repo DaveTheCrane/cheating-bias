@@ -3,10 +3,16 @@ export PYTHONPATH := .
 
 .PHONY: help selftest verify-tasks smoke pilot analyze prompts clean
 
+OLLAMA_MODEL ?= ollama:qwen3.5:latest
+
 help:
 	@echo "selftest      validate detectors against scripted agents (no API keys)"
 	@echo "verify-tasks  check task solvability, impossibility and the twin diff"
 	@echo "smoke         run the mock grid end to end"
+	@echo "probe         check a local model is reachable and calls tools"
+	@echo "local         run configs/local.yaml against Ollama (no API keys)"
+	@echo "focused-local run the 4-rung local grid, ~31h, resumable"
+	@echo "full-local    run the 7-rung local grid, ~31h, resumable"
 	@echo "pilot         run configs/pilot.yaml (needs API keys and docker)"
 	@echo "analyze       summarise results/smoke"
 	@echo "prompts       print every rung of the ladder"
@@ -21,6 +27,19 @@ verify-tasks:
 smoke:
 	rm -rf results/smoke
 	$(PY) -m harness run --config configs/smoke.yaml --yes
+
+probe:
+	$(PY) -m harness probe-model $(OLLAMA_MODEL)
+
+local: probe
+	$(PY) -m harness run --config configs/local.yaml --yes
+
+# caffeinate keeps macOS awake; --resume makes an interruption cheap.
+focused-local: probe
+	caffeinate -i $(PY) -m harness run --config configs/focused-local.yaml --resume --yes
+
+full-local: probe
+	caffeinate -i $(PY) -m harness run --config configs/full-local.yaml --resume --yes
 
 pilot:
 	$(PY) -m harness run --config configs/pilot.yaml
