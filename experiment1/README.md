@@ -27,6 +27,19 @@ python -m harness run --config configs/smoke.yaml --yes
 python -m harness analyze results/smoke --csv results/smoke/cells.csv
 ```
 
+Running against cloud models.
+
+```bash
+cd experiment1
+export PATH="$PWD/.venv/bin:$PATH"
+export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+
+python -m harness probe-model anthropic:claude-haiku-4.5
+python -m harness probe-model openai:gpt-5.6-luna
+python -m harness run --config configs/pilot-hosted.yaml --resume
+python -m harness analyze results/pilot-hosted
+```
+
 To see exactly what an agent is shown:
 
 ```bash
