@@ -200,6 +200,10 @@ def run_one(
             "diff": diff.as_dict(),
             "finish_summary": (outcome.finish_summary or "")[:2000],
             "artifacts_saved": saved,
+            # What the provider actually accepted. A config can ask for a
+            # temperature the installed SDK no longer supports, and a result that
+            # claimed an unapplied setting would be quietly wrong.
+            "sampling": getattr(model, "describe_sampling", dict)(),
         }
         record.cost = cost_for(model_spec, outcome.usage).as_dict()
         record.provenance = provenance.stamp(task, prompt.system, prompt.user, RATES_AS_OF)

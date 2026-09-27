@@ -288,6 +288,321 @@ def _check_manipulation_check(result: SelfTestResult) -> None:
         )
 
 
+def _check_hosted_adapters(result: SelfTestResult) -> None:
+    """Reproduce, offline, the two failures the first paid probe hit.
+
+    Both are regression guards built from the verbatim provider errors:
+
+    - Anthropic 1.8.0 dropped ``temperature`` from ``messages.create``, so passing
+      it raised ``TypeError`` before any request was sent.
+    - OpenAI's newer models reject ``max_tokens`` with HTTP 400 and demand
+      ``max_completion_tokens``; reasoning models reject ``temperature`` the same way.
+
+    Neither needs a network or a key: fake clients stand in for the SDKs.
+    """
+    from harness.models.anthropic_model import AnthropicModel
+    from harness.models.base import Message, ToolSchema
+    from harness.models.openai_model import OpenAIModel
+
+    schema = ToolSchema(
+        name="list_dir",
+        description="List files.",
+        parameters={"type": "object", "properties": {}, "required": []},
+    )
+    conversation = [Message(role="user", text="go")]
+
+    # -- Anthropic: an SDK whose create() has no temperature parameter ------
+    class FakeAnthropicMessages:
+        def __init__(self) -> None:
+            self.seen: dict[str, Any] = {}
+
+        # Deliberately mirrors anthropic 1.8.0: no temperature, no top_p, and no
+        # **kwargs escape hatch, so an unexpected parameter raises TypeError just
+        # as the real SDK does.
+        def create(self, *, model, max_tokens, messages, system=None, tools=None,
+                   output_config=None):
+            self.seen = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "output_config": output_config,
+            }
+
+            class Block:
+                type = "tool_use"
+                id = "t1"
+                name = "list_dir"
+                input: dict[str, Any] = {"path": "."}
+
+            class Usage:
+                input_tokens = 100
+                output_tokens = 10
+                cache_read_input_tokens = 40
+                cache_creation_input_tokens = 5
+
+            class Response:
+                content = [Block()]
+                stop_reason = "tool_use"
+                usage = Usage()
+
+            return Response()
+
+    class FakeAnthropicClient:
+        def __init__(self) -> None:
+            self.messages = FakeAnthropicMessages()
+
+    fake_anthropic = FakeAnthropicClient()
+    model = AnthropicModel("claude-haiku-4.5", temperature=0.7, max_tokens=256,
+                           client=fake_anthropic)
+    response = model.generate("SYS", conversation, [schema])
+
+    result.record(
+        response.error is None and len(response.tool_calls) == 1,
+        "anthropic: call succeeds against an SDK without temperature",
+        f"error={response.error!r} calls={len(response.tool_calls)}",
+    )
+    result.record(
+        "temperature" in (model.describe_sampling().get("dropped") or []),
+        "anthropic: the dropped temperature is reported, not silently assumed",
+        f"sampling={model.describe_sampling()}",
+    )
+    result.record(
+        response.usage.get("cached_input_tokens") == 40
+        and response.usage.get("input_tokens") == 100,
+        "anthropic: cache-read tokens captured separately from full-rate input",
+        f"usage={response.usage}",
+    )
+
+    # effort must reach output_config, since it replaced temperature
+    effort_model = AnthropicModel("claude-haiku-4.5", effort="low", client=FakeAnthropicClient())
+    effort_model.generate("SYS", conversation, [schema])
+    result.record(
+        effort_model._client.messages.seen.get("output_config") == {"effort": "low"},
+        "anthropic: effort is forwarded as output_config",
+        f"seen={effort_model._client.messages.seen}",
+    )
+
+    # Assert against the *installed* SDK too, not just the stand-in. This is what
+    # actually pins the original bug: if a future SDK reinstates temperature, this
+    # check simply stops dropping it, and if one removes another parameter the
+    # filter will catch that as well. Needs no key, since nothing is sent.
+    try:
+        import anthropic as _anthropic
+
+        from harness.models.params import filter_to_signature
+
+        real = _anthropic.Anthropic(api_key="placeholder-unused")
+        _kept, dropped_real = filter_to_signature(
+            real.messages.create,
+            {"model": "m", "max_tokens": 1, "temperature": 0.5, "messages": [], "system": "s"},
+        )
+        result.record(
+            "temperature" not in _kept,
+            "anthropic: installed SDK signature is respected for temperature",
+            f"installed SDK accepted temperature; dropped={dropped_real}",
+        )
+    except ImportError:
+        result.lines.append("  (anthropic SDK not installed; skipped live-signature check)")
+
+    # -- OpenAI: a server that rejects max_tokens, then temperature --------
+    class FakeBadRequest(Exception):
+        def __init__(self, param: str) -> None:
+            super().__init__(f"Unsupported parameter: '{param}' is not supported with this model.")
+            self.status_code = 400
+            self.body = {
+                "error": {
+                    "message": f"Unsupported parameter: '{param}' is not supported with this model.",
+                    "type": "invalid_request_error",
+                    "param": param,
+                    "code": "unsupported_parameter",
+                }
+            }
+
+    class FakeCompletions:
+        def __init__(self, reject: set[str]) -> None:
+            self.reject = reject
+            self.calls: list[dict[str, Any]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            for name in ("max_tokens", "temperature"):
+                if name in self.reject and name in kwargs:
+                    raise FakeBadRequest(name)
+
+            class Function:
+                name = "list_dir"
+                arguments = '{"path": "."}'
+
+            class Call:
+                id = "c1"
+                function = Function()
+
+            class Msg:
+                content = ""
+                tool_calls = [Call()]
+
+            class Details:
+                cached_tokens = 30
+
+            class Usage:
+                prompt_tokens = 100
+                completion_tokens = 12
+                prompt_tokens_details = Details()
+
+            class Choice:
+                message = Msg()
+                finish_reason = "tool_calls"
+
+            class Response:
+                choices = [Choice()]
+                usage = Usage()
+
+            return Response()
+
+    class FakeOpenAIClient:
+        def __init__(self, reject: set[str]) -> None:
+            self.chat = type("Chat", (), {"completions": FakeCompletions(reject)})()
+
+    # Rejecting max_tokens must not matter: the adapter should send
+    # max_completion_tokens in the first place.
+    client = FakeOpenAIClient(reject={"max_tokens"})
+    model = OpenAIModel("gpt-5.6-luna", temperature=0.5, max_tokens=256, client=client)
+    response = model.generate("SYS", conversation, [schema])
+    sent = client.chat.completions.calls[0]
+    result.record(
+        response.error is None and len(response.tool_calls) == 1,
+        "openai: succeeds on a model that rejects max_tokens",
+        f"error={response.error!r}",
+    )
+    result.record(
+        "max_completion_tokens" in sent and "max_tokens" not in sent,
+        "openai: sends max_completion_tokens, never max_tokens",
+        f"sent keys={sorted(sent)}",
+    )
+    result.record(
+        response.usage.get("input_tokens") == 70
+        and response.usage.get("cached_input_tokens") == 30,
+        "openai: cached tokens subtracted from prompt_tokens to leave full-rate input",
+        f"usage={response.usage}",
+    )
+
+    # -- OpenAI: a model whose *default* reasoning_effort blocks function tools --
+    #
+    # Verbatim shape of the gpt-5.6-luna rejection. The offending parameter is a
+    # server-side default, never sent by the harness, so dropping parameters
+    # cannot fix it: the remedy named in the error has to be applied.
+    class FakeReasoningConflict(Exception):
+        def __init__(self) -> None:
+            message = (
+                "Function tools with reasoning_effort are not supported for "
+                "gpt-5.6-luna in /v1/chat/completions. To use function tools, use "
+                "/v1/responses or set reasoning_effort to 'none'."
+            )
+            super().__init__(message)
+            self.status_code = 400
+            self.body = {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": "reasoning_effort",
+                    "code": None,
+                }
+            }
+
+    class FakeReasoningCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs.get("tools") and kwargs.get("reasoning_effort") != "none":
+                raise FakeReasoningConflict()
+
+            class Function:
+                name = "list_dir"
+                arguments = '{"path": "."}'
+
+            class Call:
+                id = "c1"
+                function = Function()
+
+            class Msg:
+                content = ""
+                tool_calls = [Call()]
+
+            class Usage:
+                prompt_tokens = 50
+                completion_tokens = 5
+                prompt_tokens_details = None
+
+            class Choice:
+                message = Msg()
+                finish_reason = "tool_calls"
+
+            class Response:
+                choices = [Choice()]
+                usage = Usage()
+
+            return Response()
+
+    reasoning_client = type(
+        "C", (), {"chat": type("Chat", (), {"completions": FakeReasoningCompletions()})()}
+    )()
+    model = OpenAIModel("gpt-5.6-luna", max_tokens=256, client=reasoning_client)
+    response = model.generate("SYS", conversation, [schema])
+    calls = reasoning_client.chat.completions.calls
+
+    result.record(
+        response.error is None and len(response.tool_calls) == 1,
+        "openai: recovers when the model's default reasoning_effort blocks tools",
+        f"error={response.error!r} after {len(calls)} call(s)",
+    )
+    result.record(
+        len(calls) >= 2 and calls[-1].get("reasoning_effort") == "none",
+        "openai: applies the remedy the error named (reasoning_effort='none')",
+        f"last call keys={sorted(calls[-1]) if calls else None}",
+    )
+    result.record(
+        model.describe_sampling().get("applied", {}).get("reasoning_effort") == "none",
+        "openai: the forced reasoning_effort is recorded in the run's sampling",
+        f"sampling={model.describe_sampling()}",
+    )
+    # The remedy must carry into later turns, not be rediscovered each time.
+    before = len(calls)
+    model.generate("SYS", conversation, [schema])
+    later = calls[before:]
+    result.record(
+        len(later) == 1 and later[0].get("reasoning_effort") == "none",
+        "openai: the remedy persists to later turns without another failed request",
+        f"calls on the next turn={len(later)}",
+    )
+
+    # A reasoning-style model that also refuses temperature must still work.
+    client = FakeOpenAIClient(reject={"max_tokens", "temperature"})
+    model = OpenAIModel("gpt-5.6-luna", temperature=0.5, max_tokens=256, client=client)
+    response = model.generate("SYS", conversation, [schema])
+    result.record(
+        response.error is None and len(response.tool_calls) == 1,
+        "openai: recovers when the model also refuses temperature",
+        f"error={response.error!r} attempts={len(client.chat.completions.calls)}",
+    )
+    result.record(
+        "temperature" in (model.describe_sampling().get("dropped") or []),
+        "openai: the dropped temperature is reported",
+        f"sampling={model.describe_sampling()}",
+    )
+
+    # Once learned, the unsupported parameter must not be re-sent every turn.
+    before = len(client.chat.completions.calls)
+    model.generate("SYS", conversation, [schema])
+    after_calls = client.chat.completions.calls[before:]
+    result.record(
+        len(after_calls) == 1 and "temperature" not in after_calls[0],
+        "openai: a learned-unsupported parameter is not retried on later turns",
+        f"subsequent calls={len(after_calls)} keys={sorted(after_calls[0]) if after_calls else None}",
+    )
+
+
 def _check_ollama_adapter(result: SelfTestResult) -> None:
     """Exercise the Ollama translation layer without a running server.
 
@@ -594,6 +909,7 @@ def run_selftest(workers: int = 4, keep: bool = False) -> SelfTestResult:
         result.lines.append("task invariants")
         _check_globs(result)
         _check_manipulation_check(result)
+        _check_hosted_adapters(result)
         _check_ollama_adapter(result)
         _check_tasks(result, scratch)
         _check_expectations(result, out_dir, workers)

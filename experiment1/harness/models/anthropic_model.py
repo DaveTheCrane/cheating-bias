@@ -19,6 +19,7 @@ from harness.models.base import (
     ToolCall,
     ToolSchema,
 )
+from harness.models.params import describe, filter_to_signature, unsupported_param
 
 MAX_ATTEMPTS = 5
 BACKOFF_BASE = 2.0
@@ -32,13 +33,29 @@ class AnthropicModel:
         model: str,
         temperature: float = 1.0,
         max_tokens: int = 4096,
+        effort: str | None = None,
         client: Any | None = None,
     ) -> None:
+        """
+        Args:
+            model: Anthropic model id.
+            temperature: Requested sampling temperature. Silently dropped if the
+                installed SDK does not accept it — 1.8.0 removed it outright — and
+                the run record reports what was actually applied.
+            max_tokens: Output cap.
+            effort: Optional ``output_config.effort``, one of low/medium/high/
+                xhigh/max. This is the sampling control that replaced temperature.
+                Left unset by default so the account default applies.
+            client: Injection point for tests.
+        """
         self.model = model
         self.spec = f"anthropic:{model}"
         self.name = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.effort = effort
+        self._dropped: list[str] = []
+        self._sampling: dict[str, Any] = {}
         if client is not None:
             self._client = client
         else:
@@ -50,6 +67,10 @@ class AnthropicModel:
                     "(pip install anthropic)"
                 ) from exc
             self._client = anthropic.Anthropic()
+
+    def describe_sampling(self) -> dict[str, Any]:
+        """What the provider actually accepted. Recorded with each run."""
+        return dict(self._sampling)
 
     # -- translation -------------------------------------------------------
 
@@ -99,24 +120,60 @@ class AnthropicModel:
 
     # -- generation --------------------------------------------------------
 
+    def _payload(
+        self, system: str, messages: list[Message], tools: list[ToolSchema]
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "system": system,
+            "messages": self._messages(messages),
+        }
+        if tools:
+            payload["tools"] = self._tools(tools)
+        if self.effort:
+            payload["output_config"] = {"effort": self.effort}
+        return payload
+
     def generate(
         self,
         system: str,
         messages: list[Message],
         tools: list[ToolSchema],
     ) -> ModelResponse:
+        payload = self._payload(system, messages, tools)
+
+        # anthropic 1.8.0 removed temperature and top_p from messages.create, so
+        # passing them raises TypeError before any request goes out. Filtering
+        # against the installed signature keeps the adapter working across SDK
+        # versions instead of pinning one.
+        payload, dropped = filter_to_signature(self._client.messages.create, payload)
+        if dropped and dropped != self._dropped:
+            self._dropped = dropped
+        self._sampling = describe(payload, self._dropped)
+
         last_error: Exception | None = None
         for attempt in range(MAX_ATTEMPTS):
             try:
-                response = self._client.messages.create(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    temperature=self.temperature,
-                    system=system,
-                    messages=self._messages(messages),
-                    tools=self._tools(tools),
-                )
+                response = self._client.messages.create(**payload)
+            except TypeError as exc:
+                # A parameter the signature check could not catch, e.g. one nested
+                # inside a TypedDict. Drop it and retry rather than failing the run.
+                name = unsupported_param(exc, set(payload))
+                if name and name in payload:
+                    payload.pop(name)
+                    self._dropped = sorted({*self._dropped, name})
+                    self._sampling = describe(payload, self._dropped)
+                    continue
+                return ModelResponse(error=f"{type(exc).__name__}: {exc}")
             except Exception as exc:  # noqa: BLE001 - provider exceptions vary
+                name = unsupported_param(exc, set(payload))
+                if name and name in payload:
+                    payload.pop(name)
+                    self._dropped = sorted({*self._dropped, name})
+                    self._sampling = describe(payload, self._dropped)
+                    continue
                 last_error = exc
                 if not _is_retryable(exc) or attempt == MAX_ATTEMPTS - 1:
                     return ModelResponse(error=f"{type(exc).__name__}: {exc}")

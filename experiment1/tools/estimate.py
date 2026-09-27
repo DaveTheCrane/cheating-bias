@@ -144,25 +144,41 @@ def report_power() -> None:
 # Cloud cost
 # --------------------------------------------------------------------------
 
-# USD per million tokens, standard tier, checked September 2026. Sources are
-# listed in the accompanying notes; verify against the provider's own pricing
-# page before committing a budget.
-CLOUD = {
-    "claude-haiku-4.5": (1.0, 5.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-opus-5.5": (4.0, 20.0),
-    "gpt-5.6-luna": (0.20, 1.20),
-    "gpt-5.6-terra": (2.0, 12.0),
-    "gpt-5.6-sol": (5.0, 30.0),
-    "gpt-6-astra": (10.0, 50.0),
-    # Ollama Cloud, metered. Illustrative small-model rate (gpt-oss:20b class);
-    # larger hosted models cost more. Ollama also sells $20/mo and $100/mo tiers
-    # that may simply absorb a grid this size.
-    "ollama-cloud-20b": (0.07, 0.30),
-}
+# Rates come from harness/pricing.py rather than being restated here, so the
+# planning numbers and the per-run figures recorded in results cannot drift apart.
+# The two models the experiment actually uses are listed first.
+CLOUD_SPECS = (
+    "anthropic:claude-haiku-4-5-20251001",
+    "openai:gpt-4.1-mini-2025-04-14",
+    "openai:gpt-4.1-nano-2025-04-14",
+    "openai:gpt-4.1-2025-04-14",
+    "openai:gpt-5.6-luna",
+    "anthropic:claude-sonnet-5",
+    "anthropic:claude-opus-5.5",
+    "openai:gpt-6-astra",
+)
+
+# Ollama Cloud is metered separately and is not in the harness rate table, since
+# the harness treats ollama:* as free (local). Illustrative small-model rate
+# (gpt-oss:20b class); larger hosted models cost more, and Ollama's $20/mo tier may
+# simply absorb a grid this size.
+OLLAMA_CLOUD = (0.07, 0.30)
 
 CACHE_READ_FRACTION = 0.10  # cached input bills at ~10% of the input rate
 CACHE_WRITE_MULTIPLIER = 1.25  # Anthropic 5-minute cache write premium
+
+
+def cloud_rates() -> dict[str, tuple[float, float]]:
+    """Resolve (input, output) USD per Mtok for each spec, plus Ollama Cloud."""
+    from harness.pricing import rate_for
+
+    out: dict[str, tuple[float, float]] = {}
+    for spec in CLOUD_SPECS:
+        rate = rate_for(spec)
+        if rate is not None and (rate.input_usd or rate.output_usd):
+            out[spec.split(":", 1)[1]] = (rate.input_usd, rate.output_usd)
+    out["ollama-cloud-20b"] = OLLAMA_CLOUD
+    return out
 
 
 def run_cost(
@@ -215,12 +231,12 @@ def report_cloud() -> None:
         print(f"-- token profile '{profile}' ({note})")
         print(f"   per run: {per_run_in:,.0f} input, {per_run_out:,.0f} output, "
               f"~{ctx:,} final context")
-        print(f"   {'model':<20}{'no caching':>14}{'with caching':>16}{'x2 models':>14}")
-        for name, (in_rate, out_rate) in CLOUD.items():
+        print(f"   {'model':<30}{'no caching':>14}{'with caching':>16}{'x2 models':>14}")
+        for name, (in_rate, out_rate) in cloud_rates().items():
             plain = run_cost(per_run_in, per_run_out, ctx, in_rate, out_rate, False) * cells
             cached = run_cost(per_run_in, per_run_out, ctx, in_rate, out_rate, True) * cells
-            print(f"   {name:<20}{'$'+format(plain,',.0f'):>14}"
-                  f"{'$'+format(cached,',.0f'):>16}{'$'+format(cached*2,',.0f'):>14}")
+            print(f"   {name:<30}{'$'+format(plain,',.2f'):>14}"
+                  f"{'$'+format(cached,',.2f'):>16}{'$'+format(cached*2,',.2f'):>14}")
         print()
 
     print("Caching saving on the input side alone:")

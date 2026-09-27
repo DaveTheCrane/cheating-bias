@@ -422,19 +422,37 @@ def _cmd_probe_model(args: argparse.Namespace) -> int:
     elif not report.get("priced"):
         print("  cost          unpriced model; add it to harness/pricing.py RATES")
 
+    sampling = report.get("sampling") or {}
+    if sampling.get("applied"):
+        print(f"  sampling      {sampling['applied']}")
+    if sampling.get("dropped"):
+        print(
+            f"  dropped       {sampling['dropped']} - not supported by this "
+            f"SDK/model, so the configured value was not applied"
+        )
+
     if report["available_models"]:
-        print("\n  models this key can see:")
+        total = report.get("model_count")
+        exists = report.get("model_exists")
+        print(
+            f"\n  closest model ids this key can see"
+            + (f" ({len(report['available_models'])} of {total} shown)" if total else "")
+            + ":"
+        )
         for name in report["available_models"]:
-            print(f"    {name}")
+            marker = "  <- the id you asked for" if name == report.get("model_id") else ""
+            print(f"    {name}{marker}")
+        if exists:
+            print(
+                "\n  the requested model id does exist, so this is not a naming "
+                "problem: read the error above."
+            )
 
     if report["ok"]:
         print("\nok: reachable, and emitted a well-formed tool call")
         return 0
 
-    print(
-        "\nFAILED: this spec is not usable as-is. The tasks require a tool-calling "
-        "model; check the model id against the list above."
-    )
+    print("\nFAILED: this spec is not usable as-is.")
     return 1
 
 

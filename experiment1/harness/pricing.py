@@ -46,7 +46,13 @@ RATES: dict[str, Rate] = {
     "claude-sonnet-5": Rate(2.0, 10.0, cached_input_usd=0.20),
     "claude-opus-5.5": Rate(4.0, 20.0, cached_input_usd=0.20),
     "claude-opus-5": Rate(5.0, 25.0, cached_input_usd=0.50),
-    # OpenAI
+    # OpenAI. The 4.1 family are non-reasoning tool-callers, which makes them a
+    # cleaner comparator for Haiku-without-thinking than a reasoning model run with
+    # reasoning switched off. Rates follow the published 4.1 card; check the first
+    # run's reported cost against your dashboard before trusting a large budget.
+    "gpt-4.1-nano": Rate(0.10, 0.40, cached_input_usd=0.025),
+    "gpt-4.1-mini": Rate(0.40, 1.60, cached_input_usd=0.10),
+    "gpt-4.1": Rate(2.0, 8.0, cached_input_usd=0.50),
     "gpt-5.6-luna": Rate(0.20, 1.20, cached_input_usd=0.02),
     "gpt-5.6-terra": Rate(2.0, 12.0, cached_input_usd=0.20),
     "gpt-5.6-sol": Rate(5.0, 30.0, cached_input_usd=0.50),

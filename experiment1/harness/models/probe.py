@@ -69,29 +69,64 @@ def probe(spec: str, provider_options: dict[str, dict] | None = None) -> dict[st
         "usage": response.usage or {},
         "cost_usd": cost.usd,
         "priced": cost.priced,
+        "sampling": getattr(model, "describe_sampling", dict)(),
         "available_models": [],
     }
 
     if report["error"]:
-        report["available_models"] = list_models(provider)
+        catalogue = all_models(provider)
+        report["available_models"] = relevant_models(provider, model_id)
+        report["model_count"] = len(catalogue)
+        report["model_exists"] = model_id in catalogue
 
     return report
 
 
-def list_models(provider: str, limit: int = 40) -> list[str]:
-    """Best-effort list of model ids the credentials can see.
-
-    Only called after a failure, to turn a bad model id into an obvious one.
-    """
+def all_models(provider: str) -> list[str]:
+    """Best-effort list of every model id the credentials can see."""
     try:
         if provider == "anthropic":
             import anthropic
 
-            return [m.id for m in anthropic.Anthropic().models.list(limit=limit).data]
+            return sorted(m.id for m in anthropic.Anthropic().models.list(limit=1000).data)
         if provider == "openai":
             import openai
 
-            return sorted(m.id for m in openai.OpenAI().models.list().data)[:limit]
+            return sorted(m.id for m in openai.OpenAI().models.list().data)
     except Exception:  # noqa: BLE001 - diagnostics must not raise
         return []
     return []
+
+
+def relevant_models(provider: str, model_id: str, limit: int = 25) -> list[str]:
+    """Model ids worth showing next to a failure.
+
+    An alphabetical head of the full list is close to useless: it truncated right
+    before the ``gpt-5.6-*`` entries and so hid the very model being asked about,
+    making a working id look absent. This ranks by similarity to what was
+    requested instead, so near-misses surface first.
+    """
+    catalogue = all_models(provider)
+    if not catalogue:
+        return []
+
+    wanted = model_id.lower()
+    # Progressively shorter prefixes of the requested id, so "gpt-5.6-luna"
+    # matches "gpt-5.6-..." before falling back to "gpt-5" and then "gpt".
+    stems = [wanted[:n] for n in range(len(wanted), 2, -1)]
+
+    ranked: list[str] = []
+    for stem in stems:
+        for name in catalogue:
+            if name.lower().startswith(stem) and name not in ranked:
+                ranked.append(name)
+        if len(ranked) >= limit:
+            break
+
+    for name in catalogue:
+        if len(ranked) >= limit:
+            break
+        if name not in ranked:
+            ranked.append(name)
+
+    return ranked[:limit]

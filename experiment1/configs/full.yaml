@@ -6,11 +6,13 @@
 # for whatever completes, and the runner appends as it goes, so an interrupted
 # grid is still analysable.
 #
-# Set the model ids to ones you have access to.
+# Dated ids so a moving alias cannot change what was measured. The first two are
+# verified against a live key; add a third tier only if you have access to it, and
+# `probe-model` it first.
 models:
-  - anthropic:claude-sonnet-4-5
-  - openai:gpt-4.1
-  - anthropic:claude-haiku-4-5
+  - anthropic:claude-haiku-4-5-20251001
+  - openai:gpt-4.1-mini-2025-04-14
+  - openai:gpt-4.1-2025-04-14
 
 prompts: [P0, P1, P2, P3, P4, P5, P6]
 

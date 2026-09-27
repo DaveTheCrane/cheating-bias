@@ -34,11 +34,15 @@ cd experiment1
 export PATH="$PWD/.venv/bin:$PATH"
 export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
 
-python -m harness probe-model anthropic:claude-haiku-4.5
-python -m harness probe-model openai:gpt-5.6-luna
+python -m harness probe-model anthropic:claude-haiku-4-5-20251001
+python -m harness probe-model openai:gpt-4.1-mini-2025-04-14
 python -m harness run --config configs/pilot-hosted.yaml --resume
 python -m harness analyze results/pilot-hosted
 ```
+
+That pilot is 36 runs for under $2. See
+[Running against hosted models](#running-against-hosted-models) for what it is
+meant to establish before you pay for a full grid.
 
 To see exactly what an agent is shown:
 
@@ -51,9 +55,9 @@ Where to go next depends on what you have:
 
 - **A local model via Ollama, and no API keys** — the common case. Go to
   [Running the experiment on one local model](#running-the-experiment-on-one-local-model).
-- **Hosted API access** — set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, replace the
-  placeholder model ids in `configs/pilot.yaml` with ones you can actually reach,
-  then `python -m harness run --config configs/pilot.yaml`.
+- **Hosted API access** — go to
+  [Running against hosted models](#running-against-hosted-models). Start with the
+  36-run paid pilot, not the full grid.
 
 ## Models
 
@@ -64,8 +68,52 @@ Where to go next depends on what you have:
 | `openai:<model-id>` | `OPENAI_API_KEY` | |
 | `ollama:<model>:<tag>` | a running `ollama serve` | no key, no egress |
 
+The committed hosted configs use `anthropic:claude-haiku-4-5-20251001` and
+`openai:gpt-4.1-mini-2025-04-14`: comparable tiers, both non-reasoning and
+tool-native, and both verified against a live key. Ids are dated rather than bare
+aliases, because an alias that moves would silently break comparability with
+results gathered earlier — the same reason every run records a task and prompt
+digest.
+
 Only the first colon separates provider from model, so `ollama:qwen3.5:latest`
 parses as provider `ollama`, model `qwen3.5:latest`.
+
+Always start with `probe-model`. It issues one real tool-calling request, prints
+what the provider accepted, and on failure lists the closest model ids the key can
+see. Use fully-qualified ids: `claude-haiku-4.5` does not resolve, while
+`claude-haiku-4-5-20251001` does.
+
+### Provider parameter quirks
+
+Hosted SDKs and models disagree about which request parameters exist, so the
+adapters adapt at runtime rather than pinning a version. Whatever was actually
+sent is recorded in `agent.sampling` on every run, because a config asking for a
+setting the provider ignored would otherwise leave results claiming it was applied.
+
+- **Anthropic 1.8.0 removed `temperature` and `top_p`** from `messages.create`.
+  They are filtered out against the installed signature, and `probe-model` reports
+  them as dropped. Sampling is now `output_config.effort`, exposed as
+  `provider_options.anthropic.effort` (`low`…`max`). **Consequence for the design:**
+  temperature is no longer controllable on Anthropic, so repeats depend on whatever
+  default applies. `analyze` warns if every repeat in a cell used identical turns
+  and token counts, which is what deterministic sampling looks like.
+- **OpenAI requires `max_completion_tokens`** on newer models; `max_tokens` is
+  rejected even though the SDK still declares it. Reasoning models additionally
+  reject `temperature`. Both are dropped adaptively when the server names them.
+- **Some OpenAI models refuse function tools alongside reasoning.** `gpt-5.6-luna`
+  applies a default `reasoning_effort` that chat-completions will not combine with
+  tools. The adapter applies the remedy the error names, `reasoning_effort: none`,
+  so such a model will run — but with reasoning off, which is not how it would be
+  deployed and makes a muddy comparison against a non-reasoning arm. This is why
+  the configs use `gpt-4.1-mini`, which is non-reasoning by design and needs no
+  compromise. Getting tools *and* reasoning would require the `/v1/responses`
+  endpoint, which is not implemented here.
+
+A consequence of the first and third points together: **the two hosted arms are not
+matched on sampling.** `gpt-4.1-mini` receives `temperature: 1.0`; Haiku cannot, and
+samples at whatever the API defaults to. Worth stating in any write-up, and worth
+watching the determinism warning for — if Haiku's repeats come back identical, its
+cells hold one observation counted n times.
 
 ### Running locally through Ollama
 
@@ -341,6 +389,74 @@ visibly prompted the model to create one, and then penalised it for that.
 The Ollama adapter also has offline coverage via an injected fake transport,
 exercising the payload shape and both argument encodings without a running server.
 The hosted adapters have no equivalent.
+
+## Running against hosted models
+
+Faster and, at these tiers, cheaper than the electricity: a 420-run grid costs
+single-digit dollars against ~31 hours of local compute. Hosted models are
+rate-limited rather than serialised, so `concurrency` above 1 actually helps.
+
+### Start with the paid pilot
+
+```bash
+cd experiment1
+export PATH="$PWD/.venv/bin:$PATH"
+export ANTHROPIC_API_KEY=... OPENAI_API_KEY=...
+
+python -m harness probe-model anthropic:claude-haiku-4-5-20251001
+python -m harness probe-model openai:gpt-4.1-mini-2025-04-14
+
+python -m harness run --config configs/pilot-hosted.yaml --resume
+python -m harness analyze results/pilot-hosted --csv pilot.csv
+```
+
+`configs/pilot-hosted.yaml` is 36 runs — 2 models × P0/P1 × 3 tasks × 3 — for under
+$2. It answers three questions in order of importance:
+
+1. **Do the adapters survive a full agent loop?** `probe-model` covers a single
+   call; only a real run exercises multi-turn transcript translation. Both live
+   failures found so far were adapter bugs, not model behaviour.
+2. **What does a run actually cost?** `analyze` reports measured spend and
+   extrapolates to 420 and 840 runs, so the full grid is budgeted from data.
+3. **Is there any headroom at P0?** Local models sat near a 0.07 cheat rate. If the
+   hosted rate is as low, the reduction rungs P2–P6 have nothing to reduce and the
+   full ladder is not worth paying for yet. P1 is the positive control: if pressure
+   does not raise the rate, no number of extra rungs or repeats will rescue it.
+
+### Then the full grid
+
+`configs/pilot.yaml` is the same two models across P0/P3/P6 at n=30 (540 runs).
+`configs/full.yaml` is the seven-rung, three-model version (2,520 runs). Both
+support `--resume`, so raising `repeats` later tops up existing cells rather than
+restarting.
+
+Switch to `--sandbox docker` for anything at that scale. The sandbox question is
+about the code the agent writes, not where the model runs, so it applies to hosted
+grids exactly as it does to local ones.
+
+### Cost reference
+
+Per 420-run grid, at the token profiles measured locally, with prompt caching. The
+low end assumes an efficient agent (~16k input tokens per run), the high end a
+verbose one (~100k):
+
+| model | per 420 runs |
+| --- | --- |
+| GPT-4.1 nano | $0.55 – $1.52 |
+| **GPT-4.1 mini** (configured) | $2.20 – $6.09 |
+| **Claude Haiku 4.5** (configured) | $6.27 – $16.90 |
+| GPT-4.1 | $10.99 – $30.47 |
+| Claude Sonnet 5 | $12.55 – $33.79 |
+
+So the configured pair costs roughly **$8.50 for a 420-run grid, or $17 for the
+840-run two-model version** at the efficient end.
+
+`python tools/estimate.py` regenerates these from `harness/pricing.py`, so the
+planning numbers and the per-run costs recorded in results cannot drift apart.
+Note that **prompt caching is not yet implemented for Anthropic** — the adapter does
+not set `cache_control` — so Haiku will bill at the uncached column until it is.
+That is the difference between $6.27 and $10.47 on a 420-run grid: worth doing
+before moving to Sonnet or above, not urgent at Haiku prices.
 
 ## Running the experiment on one local model
 

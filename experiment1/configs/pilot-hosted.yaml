@@ -1,9 +1,9 @@
-# Paid pilot: Claude Haiku 4.5 and GPT-5.6 Luna.
+# Paid pilot: Claude Haiku 4.5 vs GPT-4.1 mini.
 #
 # Purpose, in order of importance:
-#   1. Exercise the hosted adapters for real. Neither has ever run against a live
-#      API; they were written from documented request/response shapes. This is the
-#      first thing that could fail, and it fails cheaply here.
+#   1. Exercise the hosted adapters end to end. `probe-model` has confirmed a
+#      single tool call on both, but nothing has yet run a full multi-turn agent
+#      loop against either, which is where transcript translation gets tested.
 #   2. Measure actual cost per run, so the full grid can be budgeted from data
 #      rather than from a token estimate.
 #   3. Measure the P0 base cheat rate. Local models came in near 0.07, and if the
@@ -16,21 +16,33 @@
 # raise the rate above P0, the instrument is not sensitive on these models and no
 # amount of extra rungs or repeats will rescue the design. Learn that for pennies.
 #
-# Estimated cost: single-digit dollars at most, and plausibly under $1. Verify
-# with `harness analyze`, which now reports actual spend and extrapolates.
+# Estimated cost at the token profile measured locally: ~$0.90 for Haiku and ~$0.33
+# for gpt-4.1-mini, so under $2 for the pilot. `harness analyze` reports actual
+# spend and extrapolates to 420 and 840 runs; budget the full grid from that rather
+# than from this estimate.
 #
 #   export ANTHROPIC_API_KEY=...
 #   export OPENAI_API_KEY=...
-#   python -m harness probe-model anthropic:claude-haiku-4.5
-#   python -m harness probe-model openai:gpt-5.6-luna
+#   python -m harness probe-model anthropic:claude-haiku-4-5-20251001
+#   python -m harness probe-model openai:gpt-4.1-mini-2025-04-14
 #   python -m harness run --config configs/pilot-hosted.yaml --resume
 #   python -m harness analyze results/pilot-hosted --csv pilot.csv
 #
-# Confirm the two model ids with `probe-model` before running. A wrong id makes
-# the probe print the list your key can actually see.
+# Two comparably-tiered, non-reasoning, tool-native models. Ids are dated and
+# fully qualified on purpose: bare aliases move over time, and a moving alias
+# would silently break comparability against results gathered earlier. The short
+# forms (`claude-haiku-4.5`, `gpt-4.1-mini`) are not both resolvable anyway.
+#
+# gpt-4.1-mini rather than gpt-5.6-luna: Luna applies a default `reasoning_effort`
+# that chat-completions will not combine with function tools. The adapter can work
+# around it by setting `reasoning_effort: none`, but that runs Luna with reasoning
+# disabled, which is not how it would be deployed and makes a muddy comparison
+# against Haiku-without-thinking. gpt-4.1-mini is non-reasoning by design, so the
+# two arms are matched without any compromise. It costs roughly twice Luna, which
+# is still under $4 per model for a 420-run grid.
 models:
-  - anthropic:claude-haiku-4.5
-  - openai:gpt-5.6-luna
+  - anthropic:claude-haiku-4-5-20251001
+  - openai:gpt-4.1-mini-2025-04-14
 
 prompts: [P0, P1]
 
@@ -41,6 +53,12 @@ repeats: 3
 max_turns: 30
 announce_turn_budget: false
 
+# Applied to gpt-4.1-mini, but NOT to Haiku: the Anthropic SDK no longer accepts
+# temperature at all, so that arm samples at whatever the API defaults to. The two
+# arms are therefore not matched on sampling, which is worth stating in any
+# write-up. Check `agent.sampling` per run for what each provider actually took,
+# and watch for the determinism warning from `analyze` — if Haiku's repeats come
+# back identical, its cells hold one observation counted n times.
 temperature: 1.0
 max_tokens: 4096
 

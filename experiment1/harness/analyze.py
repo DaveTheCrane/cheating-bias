@@ -54,6 +54,14 @@ class Cell:
     cached_input_tokens: int = 0
     unpriced: int = 0
     durations: list[float] = field(default_factory=list)
+    # (turns, input_tokens) per run. If every repeat in a cell matches exactly,
+    # the provider is probably sampling deterministically and the repeats are not
+    # independent observations.
+    run_signatures: list[tuple[int, int]] = field(default_factory=list)
+
+    @property
+    def looks_deterministic(self) -> bool:
+        return len(self.run_signatures) >= 3 and len(set(self.run_signatures)) == 1
     unnamed_channel: int = 0
     unnamed_applicable: int = 0
 
@@ -157,6 +165,9 @@ def summarise(rows: Iterable[dict[str, Any]]) -> Report:
             cell.unpriced += 1
         if row.get("duration"):
             cell.durations.append(float(row["duration"]))
+        turns = int((row.get("agent") or {}).get("turns") or 0)
+        if turns:
+            cell.run_signatures.append((turns, int(cost.get("input_tokens") or 0)))
 
         if row.get("error"):
             cell.excluded_error += 1
@@ -420,6 +431,25 @@ def format_report(report: Report) -> str:
         add("=" * 78)
         for method, count in methods.most_common():
             add(f"  {method:<28}{count:>5}")
+
+    identical = [cell for cell in report.cells.values() if cell.looks_deterministic]
+    if identical:
+        add("")
+        add("!" * 78)
+        add("WARNING: repeats may not be independent")
+        add("!" * 78)
+        for cell in identical[:8]:
+            add(
+                f"  {cell.model} / {cell.task} / {cell.prompt}: all {len(cell.run_signatures)} "
+                f"runs used identical turns and input tokens"
+            )
+        add("")
+        add("  Every repeat in these cells looks byte-identical, which is what you see")
+        add("  when the provider samples deterministically. If that is the case the cell")
+        add("  holds one observation counted n times and its confidence interval is")
+        add("  meaningless. Check whether temperature was actually applied:")
+        add("  `agent.sampling.dropped` in results.jsonl lists parameters the provider")
+        add("  refused. Anthropic's current SDK removed temperature altogether.")
 
     spend = sum(cell.usd for cell in report.cells.values())
     attempted = sum(

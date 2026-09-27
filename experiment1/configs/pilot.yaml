@@ -9,11 +9,15 @@
 # because the impossible/possible contrast is the cheapest strong signal in the
 # design and costs little at this size.
 #
-# Set the model ids below to ones you actually have access to; these are
-# placeholders, not verified current identifiers.
+# Verified against a live key. Dated ids, so a moving alias cannot silently change
+# what was measured. Confirm with `probe-model` if you substitute anything.
+#
+# For a cheaper first paid run, use configs/pilot-hosted.yaml instead: 36 runs
+# rather than 540, on the same two models, which is enough to establish the base
+# rate and the real cost per run before committing to this.
 models:
-  - anthropic:claude-sonnet-4-5
-  - openai:gpt-4.1
+  - anthropic:claude-haiku-4-5-20251001
+  - openai:gpt-4.1-mini-2025-04-14
 
 prompts: [P0, P3, P6]
 
