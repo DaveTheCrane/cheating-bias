@@ -19,12 +19,13 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from harness import detectors, verify
+from harness import detectors, provenance, verify
 from harness.agent import run_agent
 from harness.config import GridConfig, TaskSpec, load_task
 from harness.executor import build_executor
 from harness.models import build_model
 from harness.models.mock import MockModel
+from harness.pricing import RATES_AS_OF, cost_for
 from harness.prompts import manipulation_check, render
 from harness.scoring import RunRecord, score_run
 from harness.tools import Toolbox
@@ -32,6 +33,37 @@ from harness.trace import Trace
 from harness.workspace import git_init_repo, hash_tree, materialise
 
 RESULTS_FILENAME = "results.jsonl"
+ARTIFACTS_DIRNAME = "agent_files"
+
+# Cap on any single persisted artifact. Keeps a pathological multi-megabyte write
+# from bloating the results tree while still capturing anything human-sized.
+MAX_ARTIFACT_BYTES = 256 * 1024
+
+
+def persist_agent_files(root: Path, diff: Any, destination: Path) -> list[str]:
+    """Save the agent's changed and added files alongside the run record.
+
+    This is what makes a grid re-scorable. Detectors change — three of the ones
+    here changed after real runs exposed problems — and without the final code
+    there is no way to apply a corrected detector to data you already paid for.
+    Only the files the agent touched are kept, so the cost is kilobytes per run.
+    """
+    saved: list[str] = []
+    for rel in sorted({*diff.modified, *diff.added}):
+        source = root / rel
+        if not source.is_file():
+            continue
+        try:
+            if source.stat().st_size > MAX_ARTIFACT_BYTES:
+                continue
+            text = source.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        target = destination / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        saved.append(rel)
+    return saved
 
 
 def _slug(text: str) -> str:
@@ -157,6 +189,9 @@ def run_one(
             manipulation_check_strict=attention_strict,
         )
 
+        artifacts = run_dir / ARTIFACTS_DIRNAME
+        saved = persist_agent_files(workdir, diff, artifacts)
+
         record.verification = verification
         record.detection = detection.as_dict()
         record.score = score.as_dict()
@@ -164,10 +199,14 @@ def run_one(
             **asdict(outcome),
             "diff": diff.as_dict(),
             "finish_summary": (outcome.finish_summary or "")[:2000],
+            "artifacts_saved": saved,
         }
+        record.cost = cost_for(model_spec, outcome.usage).as_dict()
+        record.provenance = provenance.stamp(task, prompt.system, prompt.user, RATES_AS_OF)
+        record.artifacts_path = str(artifacts) if saved else None
         record.error = outcome.error
 
-        trace.emit("scored", turn=-1, score=score.as_dict())
+        trace.emit("scored", turn=-1, score=score.as_dict(), cost=record.cost)
 
     except Exception as exc:  # noqa: BLE001 - a bad cell must not kill the grid
         record.error = f"{type(exc).__name__}: {exc}"

@@ -322,41 +322,5 @@ def _hint_for(code: int, detail: str, model: str) -> str:
     return ""
 
 
-def probe(
-    model: str,
-    host: str | None = None,
-    timeout: int = 120,
-) -> dict[str, Any]:
-    """Check that a local model is reachable and will actually call a tool.
-
-    Returns:
-        A dict with ``ok`` plus diagnostic detail. Used by ``harness probe-model``.
-    """
-    adapter = OllamaModel(model, temperature=0.0, max_tokens=128, host=host, timeout=timeout)
-    schema = ToolSchema(
-        name="list_dir",
-        description="List files in a directory of the working tree.",
-        parameters={
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Directory path."}},
-            "required": [],
-        },
-    )
-    started = time.perf_counter()
-    response = adapter.generate(
-        "You are working in a checked-out repository. Use the tools available.",
-        [Message(role="user", text="List the files in the repository root.")],
-        [schema],
-    )
-    elapsed = time.perf_counter() - started
-
-    return {
-        "spec": adapter.spec,
-        "host": adapter.host,
-        "ok": bool(response.tool_calls) and not response.error,
-        "error": response.error,
-        "elapsed_secs": round(elapsed, 1),
-        "tool_calls": [(call.name, call.arguments) for call in response.tool_calls],
-        "text": response.text[:200],
-        "usage": response.usage,
-    }
+# The reachability probe lives in harness/models/probe.py, which works for every
+# provider through the shared Model interface rather than duplicating it here.

@@ -91,6 +91,17 @@ def _build_parser() -> argparse.ArgumentParser:
     analyse.add_argument("--csv", help="also write per-cell rows to this CSV path")
     analyse.add_argument("--json", action="store_true", help="emit raw cell data as JSON")
 
+    again = sub.add_parser(
+        "rescore",
+        help="re-grade completed runs with the current detectors, no model calls",
+    )
+    again.add_argument("path", nargs="?", default="results", help="results dir or jsonl file")
+    again.add_argument(
+        "--write",
+        action="store_true",
+        help="write results.rescored.jsonl beside the originals",
+    )
+
     sub.add_parser("verify-tasks", help="check task solvability, impossibility and twin diff")
 
     self_test = sub.add_parser("selftest", help="validate the detectors against scripted agents")
@@ -296,6 +307,20 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_rescore(args: argparse.Namespace) -> int:
+    from harness.rescore import format_outcome, rescore, write_rescored
+
+    outcome = rescore(Path(args.path))
+    print(format_outcome(outcome))
+    if args.write:
+        written = write_rescored(outcome, Path(args.path))
+        print(f"\nwrote {written}")
+        print("originals are untouched; point `analyze` at the rescored file to use it")
+    elif outcome.changed_count:
+        print("\nre-run with --write to persist these, then: harness analyze <file>")
+    return 0
+
+
 def _cmd_verify_tasks(_args: argparse.Namespace) -> int:
     executor = build_executor("subprocess")
     scratch = Path(tempfile.mkdtemp(prefix="cheatbias-verify-"))
@@ -355,35 +380,30 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
 
 
 def _cmd_probe_model(args: argparse.Namespace) -> int:
-    """One-shot reachability and tool-calling check for a model spec.
-
-    Worth running before any grid. A model that cannot or will not emit a tool
-    call produces runs that look like total task failure, which is easy to
-    misread as a capability result rather than a plumbing problem.
-    """
-    provider, model_id = parse_spec(args.spec)
+    """One-shot reachability and tool-calling check for a model spec."""
+    provider, _model_id = parse_spec(args.spec)
 
     if provider == "mock":
         print(f"{args.spec}: mock models need no probe; run `harness selftest`.")
         return 0
 
-    if provider != "ollama":
+    if provider in ("anthropic", "openai"):
         key = f"{provider.upper()}_API_KEY"
-        state = "present" if os.environ.get(key) else "MISSING"
-        print(f"{args.spec}: hosted provider, {key} {state}")
-        print("no live probe implemented for hosted providers; run a single-cell grid instead:")
-        print(
-            f"  python -m harness run --models {args.spec} --prompts P0 "
-            f"--tasks perf_memo --repeats 1"
-        )
-        return 0 if os.environ.get(key) else 1
+        if not os.environ.get(key):
+            print(f"{key} is not set in this shell. Export it and retry:")
+            print(f"  export {key}=...")
+            return 1
 
-    from harness.models.ollama_model import probe
+    from harness.models.probe import probe
+
+    options: dict[str, dict] = {}
+    if args.host:
+        options["ollama"] = {"host": args.host}
 
     print(f"probing {args.spec} ...")
-    report = probe(model_id, host=args.host)
+    report = probe(args.spec, provider_options=options or None)
 
-    print(f"  host          {report['host']}")
+    print(f"  provider      {report['provider']}")
     print(f"  reachable     {'yes' if not report['error'] else 'NO'}")
     if report["error"]:
         print(f"  error         {report['error']}")
@@ -392,16 +412,28 @@ def _cmd_probe_model(args: argparse.Namespace) -> int:
     if report["text"]:
         print(f"  text          {report['text']!r}")
     usage = report.get("usage") or {}
-    if usage.get("input_tokens"):
-        print(f"  tokens        in={usage.get('input_tokens')} out={usage.get('output_tokens')}")
+    if usage:
+        print(
+            "  tokens        "
+            + "  ".join(f"{k}={v}" for k, v in sorted(usage.items()) if isinstance(v, int))
+        )
+    if report.get("priced") and report.get("cost_usd"):
+        print(f"  cost          ${report['cost_usd']:.6f} for this single call")
+    elif not report.get("priced"):
+        print("  cost          unpriced model; add it to harness/pricing.py RATES")
+
+    if report["available_models"]:
+        print("\n  models this key can see:")
+        for name in report["available_models"]:
+            print(f"    {name}")
 
     if report["ok"]:
-        print("\nok: the model is reachable and emitted a well-formed tool call")
+        print("\nok: reachable, and emitted a well-formed tool call")
         return 0
 
     print(
-        "\nFAILED: this spec is not usable for the experiment. The tasks require a "
-        "tool-calling model; check `ollama show <model>` for a 'tools' capability."
+        "\nFAILED: this spec is not usable as-is. The tasks require a tool-calling "
+        "model; check the model id against the list above."
     )
     return 1
 
@@ -464,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
         "run": _cmd_run,
         "analyze": _cmd_analyze,
         "verify-tasks": _cmd_verify_tasks,
+        "rescore": _cmd_rescore,
         "selftest": _cmd_selftest,
         "probe-model": _cmd_probe_model,
         "list": _cmd_list,

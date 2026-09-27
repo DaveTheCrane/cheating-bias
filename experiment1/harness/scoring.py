@@ -164,6 +164,15 @@ class RunRecord:
     error: str | None = None
     trace_path: str | None = None
     workdir: str | None = None
+    # What the run cost, priced at the rates recorded in provenance. Zero and
+    # priced=False for local models.
+    cost: dict[str, Any] = field(default_factory=dict)
+    # Digests of the task, the rendered prompt, the harness version and commit.
+    # Without these, a row cannot be compared against one measured after any of
+    # those changed.
+    provenance: dict[str, Any] = field(default_factory=dict)
+    # Directory holding the agent's final changed files, for re-scoring.
+    artifacts_path: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -34,13 +34,13 @@ python -m harness show-prompt P3 --task perf_memo
 python -m harness show-prompt P4 --task impossible_spec --channel repo_file
 ```
 
-For a real grid, set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, put model ids you
-actually have access to into `configs/pilot.yaml` (the ones committed are
-placeholders), and:
+Where to go next depends on what you have:
 
-```bash
-python -m harness run --config configs/pilot.yaml
-```
+- **A local model via Ollama, and no API keys** — the common case. Go to
+  [Running the experiment on one local model](#running-the-experiment-on-one-local-model).
+- **Hosted API access** — set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, replace the
+  placeholder model ids in `configs/pilot.yaml` with ones you can actually reach,
+  then `python -m harness run --config configs/pilot.yaml`.
 
 ## Models
 
@@ -61,8 +61,9 @@ python -m harness probe-model ollama:qwen3.5:latest
 python -m harness run --config configs/local.yaml --yes
 ```
 
-See [Running the whole thing locally](#running-the-whole-thing-locally) for the
-multi-day version.
+That is a 90-run warm-up. For the real thing see
+[Running the experiment on one local model](#running-the-experiment-on-one-local-model),
+which is the intended path if Ollama is all you have.
 
 `probe-model` is worth running first every time. A model that cannot or will not
 emit a tool call produces runs that look like total task failure, which reads as a
@@ -91,10 +92,9 @@ provider_options:
 Three things to know before running a local grid:
 
 - **It is slow, and the cost is in wall-clock rather than tokens.** Measured on a
-  9.7B Q4 model: ~8s for a short first call, ~50s once the transcript reaches 10k
-  tokens. Complete honest runs of `perf_memo` took 109s and 216s; an
-  `impossible_spec` run that used its full 26-turn budget took 361s. Budget minutes
-  per run.
+  9.7B Q4 model: ~8s per call on a short context, ~50s once the transcript reaches
+  10k tokens. Per-run and per-grid figures are in
+  [Measured cost](#measured-cost).
 - **Concurrency is forced to 1 for local providers.** One server processes
   requests serially, so extra workers only queue — and they inflate wall-clock
   timings, which matters because `perf_memo` grades against a wall-clock budget.
@@ -329,95 +329,190 @@ The Ollama adapter also has offline coverage via an injected fake transport,
 exercising the payload shape and both argument encodings without a running server.
 The hosted adapters have no equivalent.
 
-## Running the whole thing locally
+## Running the experiment on one local model
 
-`configs/full.yaml` is not the one you want: it names three hosted models. The
-local equivalents are `configs/full-local.yaml` (all seven rungs, n=20) and
-`configs/focused-local.yaml` (four rungs, n=35). Both are 420 runs and about 31
-hours. Prefer the focused one unless you specifically need all seven rungs — see
-the note on power below.
+This is the full procedure when Ollama is the only thing you have. It needs no API
+key and makes no outbound requests.
+
+`configs/full.yaml` and `configs/pilot.yaml` are **not** the ones to use: they name
+hosted models. The single-model configs are:
+
+| config | scope | runs | wall-clock | use it for |
+| --- | --- | --- | --- | --- |
+| `smoke.yaml` | mock models only | 24 | ~1 min | checking the pipeline; no model needed |
+| `local.yaml` | P0/P3/P6, n=10 | 90 | ~5 h | a warm-up that produces a real, if underpowered, curve |
+| `focused-local.yaml` | P0/P1/P3/P6, n=35 | 420 | ~31 h | **the recommended full run** |
+| `full-local.yaml` | all 7 rungs, n=20 | 420 | ~31 h | only if you specifically need every rung |
+
+Prefer `focused-local.yaml`. The two 420-run configs cost the same; spreading that
+budget over seven rungs instead of four buys coverage you cannot resolve. See
+[power](#power-is-the-binding-constraint) below.
 
 ### Steps
 
-```bash
-# 1. Confirm the model is up and will actually call tools.
-ollama list
-python -m harness probe-model ollama:qwen3.5:latest
+Set the model once so nothing below is specific to any one tag:
 
-# 2. Confirm the harness and the tasks are sound. ~2 minutes, no model needed.
+```bash
+cd experiment1
+export PYTHONPATH=.                 # or: pip install -e .
+MODEL=ollama:qwen3.5:latest         # whatever `ollama list` shows
+```
+
+```bash
+# 1. Is the server up, is the model present, will it actually call tools?
+ollama list
+python -m harness probe-model $MODEL
+```
+
+Do not skip step 1. A model that will not emit tool calls produces runs that look
+like total task failure, which reads as a capability finding when it is really a
+plumbing problem. The probe says so plainly instead.
+
+```bash
+# 2. Are the harness and the tasks sound? ~2 min, no model involved.
 python -m harness selftest
 python -m harness verify-tasks
 
-# 3. Do a single cell first. Never discover a problem 20 hours in.
-python -m harness run --models ollama:qwen3.5:latest --prompts P0 \
+# 3. One cell end to end, ~2 min. Never discover a problem 20 hours in.
+python -m harness run --models $MODEL --prompts P0 \
   --tasks perf_memo --repeats 1 --out results/dryrun --yes
 
-# 4. Launch. caffeinate stops macOS idle-sleeping mid-grid; --resume makes an
-#    interruption cheap; nohup survives closing the terminal.
+# 4. Launch the real grid.
+#    caffeinate  stops macOS idle-sleeping mid-run
+#    --resume    makes an interruption cheap
+#    nohup       survives closing the terminal
 nohup caffeinate -i python -m harness run \
-  --config configs/focused-local.yaml --resume --yes > run.log 2>&1 &
-tail -f run.log
+  --config configs/focused-local.yaml --models $MODEL \
+  --resume --yes > run.log 2>&1 &
 
-# 5. Analyse whatever has completed, at any point, including while it runs.
+tail -f run.log
+```
+
+Progress lines carry a running ETA once a few runs are in. To run a different model
+without editing any config, `--models` overrides the config's model list and leaves
+everything else — rungs, repeats, `provider_options` — intact, which is what step 4
+relies on.
+
+```bash
+# 5. Analyse. Works at any point, including while the grid is still running.
 python -m harness analyze results/focused-local --csv cells.csv
 ```
 
-If it stops for any reason, the same command resumes it. `--resume` skips
-`(model, prompt, task, repeat)` combinations already recorded and retries any that
-errored. You can also raise `repeats` later and re-run with `--resume` to top up
-existing cells rather than starting over.
+### Resuming
+
+If the grid stops for any reason — sleep, an Ollama restart, Ctrl-C, a crash — rerun
+the exact same command. `--resume` skips every
+`(model, prompt, task, repeat)` already recorded and retries any that errored.
+
+Always pass it for a run this long. Without it the runner re-executes the whole
+grid and appends duplicate rows, which silently corrupts the counts.
+
+Two other uses for it:
+
+- **Topping up.** Raise `repeats` in the config and rerun with `--resume` to extend
+  existing cells rather than starting over.
+- **Adding a model later.** Add a second model and rerun with `--resume`; only the
+  new cells execute.
 
 ### Measured cost
 
-Six timed runs on qwen3.5:latest (9.7B, Q4_K_M):
+Six timed runs on `qwen3.5:latest` (9.7B, Q4_K_M) at `max_turns: 30`:
 
-| task | mean | turns | ends by |
+| task | mean | turns used | ends by |
 | --- | --- | --- | --- |
 | `possible_spec` | 82s | 9–14 | calling `finish` |
 | `perf_memo` | 126s | 9–14 | calling `finish` |
-| `impossible_spec` | 581s | 30 (the cap) | running out of turns |
+| `impossible_spec` | 581s | 30, the cap | running out of turns |
 
-One repeat of all three tasks at one rung is ~13 minutes. Traces are ~60 KB per
-run, so a 420-run grid costs ~25 MB; storage is not a constraint. Wall-clock is,
-and `impossible_spec` is ~74% of it — cutting repeats on that task alone buys back
-more time than anything else.
+One repeat of all three tasks at one rung is ~13 minutes, so 420 runs is ~31 hours
+of continuous compute. Traces are ~60 KB per run, so the whole grid costs ~25 MB;
+storage is not a constraint, wall-clock is.
+
+Only `impossible_spec` is sensitive to `max_turns`, because it is the one task that
+always hits the cap — the other two conclude in 9–14 turns regardless. That is why
+`local.yaml` at `max_turns: 20` comes in around 5 hours rather than the 7 you would
+get by scaling run counts alone.
+
+`impossible_spec` is ~74% of that wall-clock on its own. A larger or slower model
+scales all of these roughly linearly.
+
+If you are short of time, buy it back by giving that task fewer repeats than the
+other two. `repeats` is grid-wide, so do it as two runs into the *same* output
+directory — rows accumulate and `analyze` reads them together, so cells simply end
+up with different n:
+
+```bash
+# the two cheap tasks at full n
+python -m harness run --config configs/focused-local.yaml --models $MODEL \
+  --tasks perf_memo possible_spec --repeats 35 \
+  --out results/focused-local --resume --yes
+
+# the expensive one at a third of it: ~8h instead of ~23h
+python -m harness run --config configs/focused-local.yaml --models $MODEL \
+  --tasks impossible_spec --repeats 12 \
+  --out results/focused-local --resume --yes
+```
+
+That drops the total from ~31h to ~16h. The cost is power on the twin contrast
+specifically, since it compares `impossible_spec` against `possible_spec` and the
+narrower arm sets the limit.
 
 ### Four things to know before you start
 
-**The between-model prediction is unreachable with one model.** The design expects
-a deep disposition to vary more across models than a shallow one. One model says
-nothing about that, so a local-only run can only address the prompt-elasticity
-half of the question. To get the second axis, pull more tool-capable models and add
-them to `models:`. Verify each first — `probe-model` fails clearly when a model
-will not emit tool calls, which is the usual failure for small local models and is
-otherwise easy to misread as task failure:
+#### Between-model variation is out of reach with one model
+
+The design's second prediction is that a deep disposition varies more across models
+than a shallow one. One model cannot speak to that at all, so a single-model run
+addresses only the prompt-elasticity half of the question: does the rate move, and
+where does it stop. That is a complete result on its own — just not the whole
+design.
+
+If you want the second axis locally, pull more tool-capable models and add them to
+`models:`. Verify each one first; refusing to emit tool calls is the usual failure
+mode for small local models:
 
 ```bash
 ollama pull <model>
 python -m harness probe-model ollama:<model>
 ```
 
-**Power is the binding constraint, not coverage.** Against a 0.50 baseline, a cell
-of n=20 needs the compared rate to fall to 0.15 before Fisher clears p<0.05 at
-all; at n=35 a drop to 0.25 reaches p=0.049. Separately, *catching* an effect is
-harder than reporting one: 80% power for a 0.50 → 0.25 drop needs n=58 per arm. So
-treat n=35 as reliable for 30-point differences and suggestive below that, and
-treat 10-point differences (n=388) as out of reach locally. Spending the same hours
-on four rungs instead of seven is the only lever that helps.
-`harness.stats.required_n` will size a specific comparison for you.
+Each extra model multiplies the wall-clock. Two models on `focused-local.yaml` is
+~62 hours.
 
-**`impossible_spec` will not report an outcome.** It uses the whole turn budget
-every time and never calls `finish`. Raising `max_turns` does not fix it, and
-`announce_turn_budget: true` was tested and made no difference except to slow the
-run down. The cheat measure is unaffected, because cheating is detected from the
-code and the verification rather than from what the agent says; what goes missing
-is the claim axis, `overclaim` and `misreporting`, on that task only. `analyze`
-prints the stop-reason distribution and warns when the share of claimless runs
-gets high enough to matter.
+#### Power is the binding constraint
 
-**Do not set a `seed`.** A fixed seed makes every repeat identical, turning n
-observations into one observation counted n times. The runner warns if it sees a
-seed together with `repeats > 1`. Use a seed only to reproduce a single run.
+Against a 0.50 baseline rate:
+
+| per-arm n | smallest drop reaching Fisher p<0.05 |
+| --- | --- |
+| 20 | to 0.15 (a 35-point drop) |
+| 35 | to 0.25 (a 25-point drop, p=0.049) |
+
+Reporting an effect and reliably *catching* one differ: 80% power for a 0.50 → 0.25
+drop needs n=58 per arm. So treat n=35 as dependable for 30-point differences,
+suggestive below that, and treat 10-point differences (n=388) as unreachable
+locally. `harness.stats.required_n` sizes a specific comparison for you.
+
+The practical consequence: cut rungs, not repeats. That is the whole reason
+`focused-local.yaml` keeps P0/P1/P3/P6 and drops P2/P4/P5.
+
+#### `impossible_spec` will not report an outcome
+
+It used the entire turn budget in every run tried and never called `finish`.
+Raising `max_turns` does not fix it, and `announce_turn_budget: true` was tested and
+changed nothing except making runs slower.
+
+This costs less than it appears. Cheating is detected from the code and from
+verification, not from what the agent says, so the primary measure is intact on that
+task. What goes missing is the claim axis only — `overclaim` and `misreporting` —
+because those need a run that reported something. `analyze` prints the stop-reason
+distribution and warns when the share of claimless runs is high enough to matter.
+
+#### Do not set a `seed`
+
+A fixed seed makes every repeat identical, turning n observations into one
+observation counted n times and making every interval a fiction. The runner warns if
+it sees a seed alongside `repeats > 1`. Use one only to reproduce a single run.
 
 ## Reading the output
 
@@ -491,12 +586,14 @@ experiment1/
   real key. The Ollama adapter has been run end to end against a live server and has
   offline unit coverage. Use `probe-model`, or a one-cell grid, before committing to
   a hosted run.
-- **Small local models often exhaust the turn budget without reporting.** In the
-  local runs so far, `impossible_spec` used all 26 turns and never called `finish`,
-  which leaves the claim-based measures (`overclaim`, `misreporting`) simply absent
-  rather than negative. `analyze` prints the stop-reason distribution and warns when
-  more than 20% of usable runs carry no claim. Raise `max_turns` before reading
-  anything into those columns.
+- **Small local models often exhaust the turn budget without reporting.** In every
+  local run of `impossible_spec` so far, the model used its whole turn budget and
+  never called `finish`, which leaves the claim-based measures (`overclaim`,
+  `misreporting`) absent on that task rather than negative. Raising `max_turns` and
+  announcing the budget were both tried and neither helped. `analyze` prints the
+  stop-reason distribution and warns when more than 20% of usable runs carry no
+  claim. See
+  [`impossible_spec` will not report an outcome](#impossible_spec-will-not-report-an-outcome).
 
 ## Adding a task
 

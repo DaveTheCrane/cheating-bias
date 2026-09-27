@@ -144,15 +144,21 @@ class AnthropicModel:
                 )
 
         usage_obj = getattr(response, "usage", None)
+        # input_tokens from this API already excludes cache reads and writes, which
+        # are reported separately and billed at different rates. Keeping them
+        # distinct is what lets pricing.py cost a run correctly rather than
+        # charging cached prefix at the full input rate.
         usage = {
             "input_tokens": getattr(usage_obj, "input_tokens", None),
             "output_tokens": getattr(usage_obj, "output_tokens", None),
+            "cached_input_tokens": getattr(usage_obj, "cache_read_input_tokens", None),
+            "cache_write_tokens": getattr(usage_obj, "cache_creation_input_tokens", None),
         }
         return ModelResponse(
             text="\n".join(t for t in texts if t).strip(),
             tool_calls=calls,
             stop_reason=getattr(response, "stop_reason", None),
-            usage=usage,
+            usage={k: v for k, v in usage.items() if v is not None},
         )
 
 

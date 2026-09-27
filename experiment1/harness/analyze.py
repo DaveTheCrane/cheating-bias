@@ -48,6 +48,12 @@ class Cell:
     stop_reasons: Counter = field(default_factory=Counter)
     no_claim: int = 0
     latencies: list[int] = field(default_factory=list)
+    usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    unpriced: int = 0
+    durations: list[float] = field(default_factory=list)
     unnamed_channel: int = 0
     unnamed_applicable: int = 0
 
@@ -138,6 +144,19 @@ def summarise(rows: Iterable[dict[str, Any]]) -> Report:
             report.cells[key] = cell
 
         report.totals["rows"] += 1
+
+        # Cost and duration accrue for every attempted run, including excluded
+        # ones: money spent on a run that failed the attention check was still
+        # spent, and a budget that ignored those would understate the real bill.
+        cost = row.get("cost") or {}
+        cell.usd += float(cost.get("usd") or 0.0)
+        cell.input_tokens += int(cost.get("input_tokens") or 0)
+        cell.output_tokens += int(cost.get("output_tokens") or 0)
+        cell.cached_input_tokens += int(cost.get("cached_input_tokens") or 0)
+        if cost and not cost.get("priced", True):
+            cell.unpriced += 1
+        if row.get("duration"):
+            cell.durations.append(float(row["duration"]))
 
         if row.get("error"):
             cell.excluded_error += 1
@@ -401,6 +420,48 @@ def format_report(report: Report) -> str:
         add("=" * 78)
         for method, count in methods.most_common():
             add(f"  {method:<28}{count:>5}")
+
+    spend = sum(cell.usd for cell in report.cells.values())
+    attempted = sum(
+        cell.n + cell.excluded_error + cell.excluded_manipulation
+        for cell in report.cells.values()
+    )
+    if spend > 0 or any(cell.input_tokens for cell in report.cells.values()):
+        add("")
+        add("=" * 78)
+        add("COST")
+        add("=" * 78)
+        add(f"{'model':<30}{'runs':>6}{'in tok':>12}{'cached':>11}{'out tok':>10}{'USD':>10}")
+        add("-" * 78)
+        by_model: dict[str, Cell] = {}
+        for cell in report.cells.values():
+            merged = by_model.setdefault(cell.model, Cell(model=cell.model, task="", prompt=""))
+            merged.n += cell.n + cell.excluded_error + cell.excluded_manipulation
+            merged.usd += cell.usd
+            merged.input_tokens += cell.input_tokens
+            merged.output_tokens += cell.output_tokens
+            merged.cached_input_tokens += cell.cached_input_tokens
+            merged.unpriced += cell.unpriced
+            merged.durations.extend(cell.durations)
+        for model in sorted(by_model):
+            merged = by_model[model]
+            add(
+                f"{model[:29]:<30}{merged.n:>6}{merged.input_tokens:>12,}"
+                f"{merged.cached_input_tokens:>11,}{merged.output_tokens:>10,}"
+                f"{merged.usd:>10.4f}"
+            )
+            if merged.unpriced:
+                add(
+                    f"  {merged.unpriced} run(s) used a model with no rate in "
+                    f"harness/pricing.py, so their cost reads as zero"
+                )
+        add("")
+        add(f"total spend ${spend:.4f} over {attempted} attempted run(s)")
+        if attempted:
+            per_run = spend / attempted
+            add(f"mean ${per_run:.4f} per run")
+            for scale in (420, 840):
+                add(f"  extrapolated to {scale:>4} runs: ${per_run * scale:,.2f}")
 
     if stops:
         add("")

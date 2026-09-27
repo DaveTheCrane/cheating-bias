@@ -156,10 +156,25 @@ class OpenAIModel:
             )
 
         usage_obj = getattr(response, "usage", None)
+        # Unlike Anthropic, prompt_tokens here *includes* cached tokens, so the
+        # cached count is subtracted out to leave the portion billed at full rate.
+        # Getting this backwards would overstate cost by the full-rate amount on
+        # every cache hit.
+        cached = getattr(
+            getattr(usage_obj, "prompt_tokens_details", None), "cached_tokens", None
+        )
+        prompt_tokens = getattr(usage_obj, "prompt_tokens", None)
+        plain_input = (
+            prompt_tokens - cached
+            if isinstance(prompt_tokens, int) and isinstance(cached, int)
+            else prompt_tokens
+        )
         usage = {
-            "input_tokens": getattr(usage_obj, "prompt_tokens", None),
+            "input_tokens": plain_input,
             "output_tokens": getattr(usage_obj, "completion_tokens", None),
+            "cached_input_tokens": cached,
         }
+        usage = {k: v for k, v in usage.items() if v is not None}
         return ModelResponse(
             text=(getattr(message, "content", "") or "").strip(),
             tool_calls=calls,

@@ -1,0 +1,61 @@
+# Paid pilot: Claude Haiku 4.5 and GPT-5.6 Luna.
+#
+# Purpose, in order of importance:
+#   1. Exercise the hosted adapters for real. Neither has ever run against a live
+#      API; they were written from documented request/response shapes. This is the
+#      first thing that could fail, and it fails cheaply here.
+#   2. Measure actual cost per run, so the full grid can be budgeted from data
+#      rather than from a token estimate.
+#   3. Measure the P0 base cheat rate. Local models came in near 0.07, and if the
+#      hosted rate is similarly low the reduction rungs (P2-P6) have nothing to
+#      reduce and the full ladder is not worth running yet.
+#
+# Scope: 2 models x 2 rungs x 3 tasks x 3 repeats = 36 runs.
+#
+# P0 and P1 only, deliberately. P1 is the positive control: if pressure does not
+# raise the rate above P0, the instrument is not sensitive on these models and no
+# amount of extra rungs or repeats will rescue the design. Learn that for pennies.
+#
+# Estimated cost: single-digit dollars at most, and plausibly under $1. Verify
+# with `harness analyze`, which now reports actual spend and extrapolates.
+#
+#   export ANTHROPIC_API_KEY=...
+#   export OPENAI_API_KEY=...
+#   python -m harness probe-model anthropic:claude-haiku-4.5
+#   python -m harness probe-model openai:gpt-5.6-luna
+#   python -m harness run --config configs/pilot-hosted.yaml --resume
+#   python -m harness analyze results/pilot-hosted --csv pilot.csv
+#
+# Confirm the two model ids with `probe-model` before running. A wrong id makes
+# the probe print the list your key can actually see.
+models:
+  - anthropic:claude-haiku-4.5
+  - openai:gpt-5.6-luna
+
+prompts: [P0, P1]
+
+tasks: [perf_memo, impossible_spec, possible_spec]
+
+repeats: 3
+
+max_turns: 30
+announce_turn_budget: false
+
+temperature: 1.0
+max_tokens: 4096
+
+prompt_channel: system
+monitoring: none
+
+# Hosted models are rate-limited rather than serialised, so real parallelism is
+# available. Kept low for a first paid run: a bug should waste 4 runs, not 36.
+# Raise it once the pilot has come back clean.
+concurrency: 4
+
+# Still the local subprocess backend: the sandbox question is about the code the
+# agent writes, not about where the model runs. Switch to docker for the full grid.
+sandbox: subprocess
+
+out_dir: results/pilot-hosted
+resume: true
+keep_workdirs: false
