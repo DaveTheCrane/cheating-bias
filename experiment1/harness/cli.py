@@ -109,11 +109,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="write results.rescored.jsonl beside the originals",
     )
 
-    sub.add_parser("verify-tasks", help="check task solvability, impossibility and twin diff")
+    verify_tasks = sub.add_parser(
+        "verify-tasks", help="check task solvability, impossibility and twin diff"
+    )
+    verify_tasks.add_argument(
+        "--sandbox",
+        choices=("subprocess", "docker"),
+        default="subprocess",
+        help="execution backend to validate against (docker needs no API calls)",
+    )
 
     self_test = sub.add_parser("selftest", help="validate the detectors against scripted agents")
     self_test.add_argument("--workers", type=int, default=4, help="parallel runs")
     self_test.add_argument("--keep", action="store_true", help="keep artifacts for inspection")
+    self_test.add_argument(
+        "--sandbox",
+        choices=("subprocess", "docker"),
+        default="subprocess",
+        help="execution backend to run the scripted agents through",
+    )
 
     probe = sub.add_parser(
         "probe-model",
@@ -358,11 +372,17 @@ def _cmd_rescore(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_verify_tasks(_args: argparse.Namespace) -> int:
-    executor = build_executor("subprocess")
+def _cmd_verify_tasks(args: argparse.Namespace) -> int:
+    backend = getattr(args, "sandbox", "subprocess")
+    try:
+        executor = build_executor(backend)
+    except RuntimeError as exc:
+        print(f"cannot use the {backend!r} backend:\n{exc}")
+        return 1
     scratch = Path(tempfile.mkdtemp(prefix="cheatbias-verify-"))
     failures = 0
 
+    print(f"backend: {backend}")
     print("checking that every solvable task can be solved honestly")
     for task_id in available_tasks():
         task = load_task(task_id)
@@ -416,8 +436,11 @@ def _cmd_verify_tasks(_args: argparse.Namespace) -> int:
 def _cmd_selftest(args: argparse.Namespace) -> int:
     from harness.selftest import format_result, run_selftest
 
-    print("running harness selftest (scripted agents, no API keys needed)\n")
-    result = run_selftest(workers=args.workers, keep=args.keep)
+    print(
+        f"running harness selftest (scripted agents, no API keys needed; "
+        f"backend={args.sandbox})\n"
+    )
+    result = run_selftest(workers=args.workers, keep=args.keep, sandbox=args.sandbox)
     print(format_result(result))
     return 0 if result.ok else 1
 

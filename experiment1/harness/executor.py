@@ -26,7 +26,17 @@ from pathlib import Path
 ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "TZ", "HOME", "TMPDIR", "SYSTEMROOT")
 
 MAX_CAPTURE_CHARS = 40_000
-DEFAULT_IMAGE = "python:3.12-slim"
+
+# Built from docker/Dockerfile. Deliberately not a stock python image: those carry no
+# pytest, and the sandbox runs with --network none so a container cannot install it.
+# Every task command would fail with "No module named pytest", which the harness reads
+# as a failing suite — so the whole grid would come back all-failing rather than
+# erroring. `make sandbox-image` builds it.
+DEFAULT_IMAGE = "cheating-bias-sandbox:latest"
+
+# Result of the one-off image check, keyed by image, so a grid pays for it once per
+# process rather than once per run.
+_IMAGE_CHECKS: dict[str, str | None] = {}
 
 
 @dataclass
@@ -192,7 +202,13 @@ class DockerExecutor:
 
     name = "docker"
 
-    def __init__(self, image: str = DEFAULT_IMAGE, memory: str = "1g", cpus: str = "1.0") -> None:
+    def __init__(
+        self,
+        image: str = DEFAULT_IMAGE,
+        memory: str = "1g",
+        cpus: str = "1.0",
+        check_image: bool = True,
+    ) -> None:
         if shutil.which("docker") is None:
             raise RuntimeError(
                 "docker backend requested but the docker CLI is not on PATH. "
@@ -201,6 +217,10 @@ class DockerExecutor:
         self.image = image
         self.memory = memory
         self.cpus = cpus
+        if check_image:
+            problem = check_sandbox_image(image)
+            if problem:
+                raise RuntimeError(problem)
 
     def run(
         self,
@@ -215,6 +235,20 @@ class DockerExecutor:
         else:
             inner = list(argv)
             command = " ".join(inner)
+
+        # Docker requires an absolute host path for a bind mount: given a relative
+        # one it creates a *named volume* instead and fails with exit 125. Grid
+        # workdirs are built under `out_dir`, which is usually a relative path from
+        # the config, so this is the normal case rather than an edge case.
+        mount = Path(cwd).resolve()
+        if not mount.is_dir():
+            return CommandResult(
+                command=command,
+                returncode=125,
+                stdout="",
+                stderr=f"working directory does not exist: {mount}",
+                duration=0.0,
+            )
 
         docker_argv = [
             "docker",
@@ -231,7 +265,7 @@ class DockerExecutor:
             "--workdir",
             "/work",
             "--volume",
-            f"{cwd}:/work",
+            f"{mount}:/work",
             "--env",
             "PYTHONPATH=/work",
             "--env",
@@ -267,6 +301,48 @@ class DockerExecutor:
             stderr=_truncate(completed.stderr or ""),
             duration=time.perf_counter() - start,
         )
+
+
+def check_sandbox_image(image: str = DEFAULT_IMAGE) -> str | None:
+    """Confirm a sandbox image exists and can run pytest. None means it is usable.
+
+    Checked once per process because the failure it catches is silent: an image
+    without pytest turns every task command into "No module named pytest", which the
+    verification layer scores as a failing test suite. A whole grid would come back
+    uniformly failing, looking like a result rather than a setup error.
+    """
+    if image in _IMAGE_CHECKS:
+        return _IMAGE_CHECKS[image]
+
+    problem: str | None = None
+    try:
+        completed = subprocess.run(
+            [
+                "docker", "run", "--rm", "--network", "none", image,
+                "python", "-c",
+                "import pytest, sys; print(sys.version.split()[0], pytest.__version__)",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError:
+        problem = "the docker CLI is not on PATH"
+    except subprocess.TimeoutExpired:
+        problem = f"timed out checking image {image!r}; is the docker daemon running?"
+    else:
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            tail = detail[-1] if detail else "no detail"
+            problem = (
+                f"sandbox image {image!r} is not usable: {tail}\n"
+                f"Build it with:  docker build -t {image} docker/    (or: make sandbox-image)\n"
+                f"Without pytest in the image every task command fails and the whole grid "
+                f"comes back failing."
+            )
+
+    _IMAGE_CHECKS[image] = problem
+    return problem
 
 
 def build_executor(kind: str = "subprocess", **kwargs: object):

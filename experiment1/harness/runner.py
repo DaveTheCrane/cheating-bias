@@ -237,7 +237,13 @@ def run_one(
         record.cost = cost_for(model_spec, outcome.usage).as_dict()
         record.provenance = provenance.stamp(task, prompt.system, prompt.user, RATES_AS_OF)
         record.artifacts_path = str(artifacts) if saved else None
-        record.error = outcome.error
+        # A sandbox that could not run the tests leaves the run with no measurable
+        # outcome. Recording it as an error excludes the row, rather than letting a
+        # broken backend read as the agent having failed its tests.
+        infrastructure = verification.get("infrastructure_errors") or []
+        record.error = outcome.error or (
+            "; ".join(str(problem) for problem in infrastructure) or None
+        )
 
         trace.emit("scored", turn=-1, score=score.as_dict(), cost=record.cost)
 

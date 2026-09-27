@@ -206,14 +206,14 @@ class SelfTestResult:
             self.failures.append(Failure(what=what, detail=detail))
 
 
-def _config(out_dir: Path) -> GridConfig:
+def _config(out_dir: Path, sandbox: str = "subprocess") -> GridConfig:
     return GridConfig(
         models=[],
         prompts=["P0"],
         tasks=[],
         repeats=1,
         max_turns=20,
-        sandbox="subprocess",
+        sandbox=sandbox,
         out_dir=str(out_dir),
         keep_workdirs=False,
         command_timeout_cap=TIMEOUT_CAP,
@@ -1076,8 +1076,8 @@ def _check_ollama_adapter(result: SelfTestResult) -> None:
     )
 
 
-def _check_tasks(result: SelfTestResult, scratch: Path) -> None:
-    executor = build_executor("subprocess")
+def _check_tasks(result: SelfTestResult, scratch: Path, sandbox: str = "subprocess") -> None:
+    executor = build_executor(sandbox)
 
     for task_id in ("perf_memo", "possible_spec"):
         task = load_task(task_id)
@@ -1131,8 +1131,10 @@ def _run_expectation(expectation: Expectation, config: GridConfig, out_dir: Path
     return record.as_dict()
 
 
-def _check_expectations(result: SelfTestResult, out_dir: Path, workers: int) -> None:
-    config = _config(out_dir)
+def _check_expectations(
+    result: SelfTestResult, out_dir: Path, workers: int, sandbox: str = "subprocess"
+) -> None:
+    config = _config(out_dir, sandbox)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         rows = list(pool.map(lambda e: (e, _run_expectation(e, config, out_dir)), EXPECTATIONS))
@@ -1203,8 +1205,19 @@ def _check_expectations(result: SelfTestResult, out_dir: Path, workers: int) -> 
             )
 
 
-def run_selftest(workers: int = 4, keep: bool = False) -> SelfTestResult:
-    """Run every self-check. Returns the result; does not raise on failure."""
+def run_selftest(
+    workers: int = 4, keep: bool = False, sandbox: str = "subprocess"
+) -> SelfTestResult:
+    """Run every self-check. Returns the result; does not raise on failure.
+
+    Args:
+        workers: Parallel runs.
+        keep: Leave artifacts on disk for inspection.
+        sandbox: Execution backend. Running this with ``docker`` is the cheapest
+            full validation of the sandbox path: it exercises every executor call
+            the real grid makes, including the task test suites, without a single
+            model API request.
+    """
     result = SelfTestResult()
     scratch = Path(tempfile.mkdtemp(prefix="cheatbias-selftest-"))
     out_dir = scratch / "results"
@@ -1217,8 +1230,8 @@ def run_selftest(workers: int = 4, keep: bool = False) -> SelfTestResult:
         _check_results_accumulation(result, scratch)
         _check_hosted_adapters(result)
         _check_ollama_adapter(result)
-        _check_tasks(result, scratch)
-        _check_expectations(result, out_dir, workers)
+        _check_tasks(result, scratch, sandbox)
+        _check_expectations(result, out_dir, workers, sandbox)
     finally:
         if not keep:
             shutil.rmtree(scratch, ignore_errors=True)
