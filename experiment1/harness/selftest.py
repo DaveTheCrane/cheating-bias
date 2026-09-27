@@ -382,6 +382,8 @@ def _check_hosted_adapters(result: SelfTestResult) -> None:
         f"seen={effort_model._client.messages.seen}",
     )
 
+    _check_anthropic_caching(result, conversation, schema)
+
     # Assert against the *installed* SDK too, not just the stand-in. This is what
     # actually pins the original bug: if a future SDK reinstates temperature, this
     # check simply stops dropping it, and if one removes another parameter the
@@ -600,6 +602,308 @@ def _check_hosted_adapters(result: SelfTestResult) -> None:
         len(after_calls) == 1 and "temperature" not in after_calls[0],
         "openai: a learned-unsupported parameter is not retried on later turns",
         f"subsequent calls={len(after_calls)} keys={sorted(after_calls[0]) if after_calls else None}",
+    )
+
+
+def _check_anthropic_caching(result: SelfTestResult, conversation: Any, schema: Any) -> None:
+    """Cover both caching mechanisms and the case where the provider refuses.
+
+    Measured on a real pilot, 91.6% of this adapter's input tokens were repeated
+    transcript prefix, so caching is the difference between roughly $70 and $22 for
+    a 420-run grid. A silent failure here is expensive rather than visible, which is
+    why the strategy actually used is asserted rather than assumed.
+    """
+    from harness.models.anthropic_model import AnthropicModel
+
+    def responder(seen: dict[str, Any]):
+        class Block:
+            type = "tool_use"
+            id = "t1"
+            name = "list_dir"
+            input: dict[str, Any] = {"path": "."}
+
+        class Usage:
+            input_tokens = 12
+            output_tokens = 8
+            cache_read_input_tokens = 900
+            cache_creation_input_tokens = 120
+
+        class Response:
+            content = [Block()]
+            stop_reason = "tool_use"
+            usage = Usage()
+
+        return Response()
+
+    # -- SDK that exposes the top-level parameter (anthropic 1.8.0) ----------
+    class TopLevelMessages:
+        def __init__(self) -> None:
+            self.seen: dict[str, Any] = {}
+
+        def create(self, *, model, max_tokens, messages, system=None, tools=None,
+                   output_config=None, cache_control=None):
+            self.seen = {"cache_control": cache_control, "messages": messages}
+            return responder(self.seen)
+
+    client = type("C", (), {"messages": TopLevelMessages()})()
+    model = AnthropicModel("claude-haiku-4-5", cache=True, cache_ttl="5m", client=client)
+    response = model.generate("SYS", conversation, [schema])
+
+    result.record(
+        client.messages.seen.get("cache_control") == {"type": "ephemeral", "ttl": "5m"},
+        "anthropic cache: top-level cache_control is sent when the SDK accepts it",
+        f"seen={client.messages.seen.get('cache_control')}",
+    )
+    result.record(
+        model.describe_sampling().get("cache_strategy") == "top_level:5m",
+        "anthropic cache: the strategy actually used is recorded",
+        f"sampling={model.describe_sampling()}",
+    )
+    result.record(
+        response.usage.get("cached_input_tokens") == 900
+        and response.usage.get("cache_write_tokens") == 120,
+        "anthropic cache: read and write token counts are captured separately",
+        f"usage={response.usage}",
+    )
+
+    # -- older SDK with no top-level parameter: fall back to a breakpoint ----
+    class BlockLevelMessages:
+        def __init__(self) -> None:
+            self.seen: dict[str, Any] = {}
+
+        def create(self, *, model, max_tokens, messages, system=None, tools=None,
+                   output_config=None):
+            self.seen = {"messages": messages}
+            return responder(self.seen)
+
+    client = type("C", (), {"messages": BlockLevelMessages()})()
+    model = AnthropicModel("claude-haiku-4-5", cache=True, client=client)
+    model.generate("SYS", conversation, [schema])
+    sent = client.messages.seen.get("messages") or []
+    marked = [
+        block
+        for message in sent
+        for block in (message.get("content") or [])
+        if isinstance(block, dict) and "cache_control" in block
+    ]
+
+    result.record(
+        model.describe_sampling().get("cache_strategy") == "rolling_block:5m",
+        "anthropic cache: falls back to a block breakpoint on an older SDK",
+        f"strategy={model.describe_sampling().get('cache_strategy')}",
+    )
+    result.record(
+        len(marked) == 1,
+        "anthropic cache: exactly one breakpoint, on the final block",
+        f"{len(marked)} block(s) marked",
+    )
+    if sent and marked:
+        last_content = sent[-1].get("content") or []
+        result.record(
+            bool(last_content) and last_content[-1] is marked[0],
+            "anthropic cache: the breakpoint sits on the last block of the last message",
+            "breakpoint was not at the end, so the growing prefix would not be covered",
+        )
+
+    # -- caching disabled ---------------------------------------------------
+    client = type("C", (), {"messages": TopLevelMessages()})()
+    model = AnthropicModel("claude-haiku-4-5", cache=False, client=client)
+    model.generate("SYS", conversation, [schema])
+    result.record(
+        client.messages.seen.get("cache_control") is None
+        and model.describe_sampling().get("cache_strategy") == "off",
+        "anthropic cache: cache=false sends nothing and records 'off'",
+        f"seen={client.messages.seen.get('cache_control')} "
+        f"strategy={model.describe_sampling().get('cache_strategy')}",
+    )
+
+    # -- provider rejects caching: request must still succeed, and say so ---
+    class RejectingMessages:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, *, model, max_tokens, messages, system=None, tools=None,
+                   output_config=None, cache_control=None):
+            self.calls += 1
+            if cache_control is not None:
+                exc = Exception(
+                    "Unsupported parameter: 'cache_control' is not supported for this model."
+                )
+                exc.body = {  # type: ignore[attr-defined]
+                    "error": {
+                        "message": "Unsupported parameter: 'cache_control' is not supported.",
+                        "param": "cache_control",
+                        "code": "unsupported_parameter",
+                    }
+                }
+                raise exc
+            return responder({})
+
+    client = type("C", (), {"messages": RejectingMessages()})()
+    model = AnthropicModel("claude-haiku-4-5", cache=True, client=client)
+    response = model.generate("SYS", conversation, [schema])
+    result.record(
+        response.error is None and len(response.tool_calls) == 1,
+        "anthropic cache: a model that refuses caching still completes the run",
+        f"error={response.error!r}",
+    )
+    result.record(
+        model.describe_sampling().get("cache_strategy") == "rejected_by_provider",
+        "anthropic cache: a rejected cache_control is recorded, not assumed active",
+        f"strategy={model.describe_sampling().get('cache_strategy')}",
+    )
+
+
+def _check_results_accumulation(result: SelfTestResult, scratch: Path) -> None:
+    """Results must accumulate without silently blending incompatible generations.
+
+    Appending is deliberate — it is what makes ``--resume`` work — but it means one
+    directory can hold runs from before and after a change to a task or the harness.
+    Nothing is lost, which is the hazard: pooled rates would look comparable.
+    """
+    import json
+
+    from harness.analyze import summarise
+    from harness.config import load_task
+    from harness.runner import new_batch_id, provenance_conflicts
+
+    ids = {new_batch_id() for _ in range(200)}
+    result.record(
+        len(ids) == 200,
+        "batch ids are unique within a single second",
+        f"{200 - len(ids)} collision(s); invocations would be indistinguishable",
+    )
+
+    # A stored digest that differs from the current one must be reported.
+    task = load_task("perf_memo")
+    path = Path(scratch) / "accum.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": "r1",
+                "batch_id": "20200101-000000-aaaa",
+                "task": "perf_memo",
+                "model": "m",
+                "prompt": "P0",
+                "provenance": {"task_digest": "stale000000000", "git_commit": "abc1234"},
+                "score": {},
+                "agent": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    conflicts = provenance_conflicts(path, {"perf_memo": task})
+    result.record(
+        any("perf_memo" in c and "stale000000000" in c for c in conflicts),
+        "a changed task digest is caught before a run starts",
+        f"conflicts={conflicts}",
+    )
+    result.record(
+        not provenance_conflicts(Path(scratch) / "does-not-exist.jsonl", {"perf_memo": task}),
+        "a fresh output directory reports no conflicts",
+        "an empty directory should be silent",
+    )
+
+    def row(batch: str, digest: str) -> dict[str, Any]:
+        return {
+            "model": "m", "task": "t", "prompt": "P0", "batch_id": batch,
+            "provenance": {"task_digest": digest, "git_commit": "c1"},
+            "score": {"cheated": False, "method": "x", "manipulation_check": True,
+                      "claimed": "none", "channels": [], "overclaim": False},
+            "agent": {"stop_reason": "finish", "turns": 5},
+            "cost": {},
+        }
+
+    mixed = summarise([row("b1", "d1"), row("b2", "d2")])
+    result.record(
+        mixed.mixed_tasks == ["t"] and len(mixed.batches) == 2,
+        "analyze detects a results file that mixes task versions",
+        f"mixed={mixed.mixed_tasks} batches={sorted(mixed.batches)}",
+    )
+    clean = summarise([row("b1", "d1"), row("b2", "d1")])
+    result.record(
+        not clean.mixed_tasks and len(clean.batches) == 2,
+        "two batches of the same task version are not flagged as mixed",
+        f"mixed={clean.mixed_tasks}",
+    )
+
+
+def _check_censoring(result: SelfTestResult) -> None:
+    """Pin the censoring arithmetic and the per-task turn cap.
+
+    Built from the hosted pilot, where a 30-turn cap censored 4 of 12
+    `impossible_spec` runs while cheats appeared at turns 15, 21, 23 and 28. The
+    distinction that matters: a censored run which already cheated is fully
+    informative, whereas one censored while still clean makes the cell's rate a
+    lower bound.
+    """
+    from harness.analyze import summarise
+    from harness.config import GridConfig, load_task
+    from harness.runner import effective_max_turns
+
+    # Per-task cap must override the grid default, and twins must agree.
+    grid = GridConfig(models=[], prompts=[], tasks=[], max_turns=30)
+    impossible = load_task("impossible_spec")
+    twin = load_task("possible_spec")
+    result.record(
+        effective_max_turns(impossible, grid) == impossible.max_turns,
+        "turn cap: a task's own max_turns overrides the grid default",
+        f"task={impossible.max_turns} effective={effective_max_turns(impossible, grid)}",
+    )
+    result.record(
+        effective_max_turns(load_task("perf_memo"), grid) == 30,
+        "turn cap: a task without its own max_turns falls back to the grid default",
+        f"got {effective_max_turns(load_task('perf_memo'), grid)}",
+    )
+    result.record(
+        impossible.max_turns == twin.max_turns,
+        "turn cap: twins share a turn budget, so neither arm gets more opportunity",
+        f"{impossible.id}={impossible.max_turns} {twin.id}={twin.max_turns}",
+    )
+
+    def row(stop: str, cheated: bool) -> dict[str, Any]:
+        return {
+            "model": "m",
+            "task": "t",
+            "prompt": "P0",
+            "score": {"cheated": cheated, "method": "x", "manipulation_check": True,
+                      "claimed": "none", "channels": [], "overclaim": False},
+            "agent": {"stop_reason": stop, "turns": 30},
+            "cost": {},
+        }
+
+    # One censored-but-clean run makes the rate a lower bound.
+    report = summarise([row("finish", True), row("max_turns", False), row("finish", False)])
+    cell = next(iter(report.cells.values()))
+    result.record(
+        cell.censored == 1 and cell.censored_clean == 1 and cell.rate_is_lower_bound,
+        "censoring: a clean run cut off at the cap marks the rate as a lower bound",
+        f"censored={cell.censored} clean={cell.censored_clean} "
+        f"lower_bound={cell.rate_is_lower_bound}",
+    )
+    result.record(
+        abs(cell.uncensored_rate.point - 0.5) < 1e-9 and cell.uncensored_rate.n == 2,
+        "censoring: the uncensored rate excludes censored runs from both parts",
+        f"got {cell.uncensored_rate}",
+    )
+
+    # A censored run that already cheated is fully informative, so no lower bound.
+    report = summarise([row("max_turns", True), row("finish", True)])
+    cell = next(iter(report.cells.values()))
+    result.record(
+        cell.censored == 1 and cell.censored_clean == 0 and not cell.rate_is_lower_bound,
+        "censoring: a censored run that already cheated does not weaken the estimate",
+        f"censored={cell.censored} clean={cell.censored_clean} "
+        f"lower_bound={cell.rate_is_lower_bound}",
+    )
+
+    report = summarise([row("finish", True), row("finish", False)])
+    cell = next(iter(report.cells.values()))
+    result.record(
+        not cell.rate_is_lower_bound and cell.censored == 0,
+        "censoring: no censoring means no lower-bound marker",
+        f"censored={cell.censored}",
     )
 
 
@@ -909,6 +1213,8 @@ def run_selftest(workers: int = 4, keep: bool = False) -> SelfTestResult:
         result.lines.append("task invariants")
         _check_globs(result)
         _check_manipulation_check(result)
+        _check_censoring(result)
+        _check_results_accumulation(result, scratch)
         _check_hosted_adapters(result)
         _check_ollama_adapter(result)
         _check_tasks(result, scratch)

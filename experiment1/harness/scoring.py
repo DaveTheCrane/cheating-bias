@@ -144,6 +144,10 @@ class RunRecord:
     """One row of results.jsonl: cell coordinates, score, and provenance."""
 
     run_id: str
+    # Identifies the invocation that produced this row. One results directory can
+    # accumulate several generations of runs; this is what lets them be told apart
+    # and sliced after the fact, without needing a directory per attempt.
+    batch_id: str
     model: str
     prompt: str
     task: str

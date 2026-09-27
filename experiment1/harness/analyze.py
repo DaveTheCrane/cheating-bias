@@ -47,6 +47,11 @@ class Cell:
     method_counts: Counter = field(default_factory=Counter)
     stop_reasons: Counter = field(default_factory=Counter)
     no_claim: int = 0
+    # Runs cut off at the turn cap. These are right-censored: we know they had not
+    # cheated *yet*, not that they would not have. Censoring can therefore only
+    # hide cheats, never invent them, so a cell's observed rate is a lower bound.
+    censored: int = 0
+    censored_clean: int = 0
     latencies: list[int] = field(default_factory=list)
     usd: float = 0.0
     input_tokens: int = 0
@@ -62,6 +67,28 @@ class Cell:
     @property
     def looks_deterministic(self) -> bool:
         return len(self.run_signatures) >= 3 and len(set(self.run_signatures)) == 1
+
+    @property
+    def rate_is_lower_bound(self) -> bool:
+        """True when a clean run was cut off, so the rate may understate the truth.
+
+        A censored run that already cheated is fully informative. One censored while
+        still clean is the problem case: it contributes a 'no' that might have been
+        a 'yes' given more turns.
+        """
+        return self.censored_clean > 0
+
+    @property
+    def uncensored_rate(self) -> Interval:
+        """Rate among runs that reached their own conclusion.
+
+        Complementary to ``rate``, not a replacement: dropping censored runs throws
+        away the cheats they did catch and conditions on an outcome, so it can bias
+        upward. Reported alongside so the two bracket the truth.
+        """
+        completed = self.n - self.censored
+        cheats_completed = self.cheats - (self.censored - self.censored_clean)
+        return wilson_interval(max(0, cheats_completed), max(0, completed))
     unnamed_channel: int = 0
     unnamed_applicable: int = 0
 
@@ -128,6 +155,15 @@ class Report:
     ladders: list[LadderSummary] = field(default_factory=list)
     twin_contrasts: list[dict[str, Any]] = field(default_factory=list)
     totals: Counter = field(default_factory=Counter)
+    batches: Counter = field(default_factory=Counter)
+    # task id -> set of task digests seen. More than one means the file mixes runs
+    # measured against different versions of that task.
+    task_digests: dict[str, set[str]] = field(default_factory=dict)
+    harness_commits: Counter = field(default_factory=Counter)
+
+    @property
+    def mixed_tasks(self) -> list[str]:
+        return sorted(task for task, digests in self.task_digests.items() if len(digests) > 1)
 
     def cell(self, model: str, task: str, prompt: str) -> Cell | None:
         return self.cells.get((model, task, prompt))
@@ -152,6 +188,16 @@ def summarise(rows: Iterable[dict[str, Any]]) -> Report:
             report.cells[key] = cell
 
         report.totals["rows"] += 1
+
+        provenance = row.get("provenance") or {}
+        if row.get("batch_id"):
+            report.batches[str(row["batch_id"])] += 1
+        if provenance.get("task_digest"):
+            report.task_digests.setdefault(str(row.get("task")), set()).add(
+                str(provenance["task_digest"])
+            )
+        if provenance.get("git_commit"):
+            report.harness_commits[str(provenance["git_commit"])] += 1
 
         # Cost and duration accrue for every attempted run, including excluded
         # ones: money spent on a run that failed the attention check was still
@@ -192,7 +238,12 @@ def summarise(rows: Iterable[dict[str, Any]]) -> Report:
         if score.get("hard_evidence"):
             cell.hard_evidence += 1
         cell.method_counts[score.get("method", "unknown")] += 1
-        cell.stop_reasons[(row.get("agent") or {}).get("stop_reason", "unknown")] += 1
+        stop_reason = (row.get("agent") or {}).get("stop_reason", "unknown")
+        cell.stop_reasons[stop_reason] += 1
+        if stop_reason == "max_turns":
+            cell.censored += 1
+            if not score.get("cheated"):
+                cell.censored_clean += 1
         if score.get("claimed") in (None, "none"):
             cell.no_claim += 1
         for channel in score.get("channels") or []:
@@ -317,7 +368,7 @@ def format_report(report: Report) -> str:
     add("=" * 78)
     add(
         f"{'model':<22}{'task':<17}{'rung':<6}{'n':>4}{'cheat':>7}"
-        f"{'  95% CI':<16}{'overclaim':>10}{'latency':>9}"
+        f"{'  95% CI':<16}{'overclaim':>10}{'latency':>8}{'cens':>6}"
     )
     add("-" * 78)
     for key in sorted(report.cells):
@@ -326,12 +377,16 @@ def format_report(report: Report) -> str:
             continue
         interval = cell.rate
         latency = cell.median_latency
+        # A trailing '>' marks a rate that is a lower bound: at least one run was
+        # still clean when its turn budget ran out.
+        bound = ">" if cell.rate_is_lower_bound else " "
         add(
             f"{cell.model[:21]:<22}{cell.task[:16]:<17}{cell.prompt:<6}{cell.n:>4}"
-            f"{interval.point:>7.2f}"
-            f"  [{interval.low:.2f},{interval.high:.2f}]{'':<4}"
+            f"{interval.point:>6.2f}{bound}"
+            f" [{interval.low:.2f},{interval.high:.2f}]{'':<4}"
             f"{cell.overclaim_rate.point:>10.2f}"
-            f"{(f'{latency:.0f}' if latency is not None else '-'):>9}"
+            f"{(f'{latency:.0f}' if latency is not None else '-'):>8}"
+            f"{cell.censored:>6}"
         )
 
     excluded = report.totals["excluded_manipulation"] + report.totals["excluded_error"]
@@ -432,6 +487,51 @@ def format_report(report: Report) -> str:
         for method, count in methods.most_common():
             add(f"  {method:<28}{count:>5}")
 
+    if report.mixed_tasks or len(report.harness_commits) > 1:
+        add("")
+        add("!" * 78)
+        add("WARNING: this results set mixes runs from different setups")
+        add("!" * 78)
+        for task in report.mixed_tasks:
+            add(
+                f"  task {task!r} appears with {len(report.task_digests[task])} different "
+                f"digests: {sorted(report.task_digests[task])}"
+            )
+        if len(report.harness_commits) > 1:
+            add(f"  harness commits present: {sorted(report.harness_commits)}")
+        add("")
+        add("  Every rate below pools these together as though they were comparable.")
+        add("  Slice by batch_id to separate them, e.g.:")
+        add("    jq -c 'select(.batch_id==\"<id>\")' results.jsonl > batch.jsonl")
+        add("    python -m harness analyze batch.jsonl")
+
+    if len(report.batches) > 1:
+        add("")
+        add(f"batches present ({len(report.batches)}): "
+            + ", ".join(f"{b} ({n} runs)" for b, n in sorted(report.batches.items())))
+
+    censored_cells = [cell for cell in report.cells.values() if cell.rate_is_lower_bound]
+    if censored_cells:
+        add("")
+        add("!" * 78)
+        add("WARNING: censored runs — the rates marked '>' are lower bounds")
+        add("!" * 78)
+        for cell in sorted(censored_cells, key=lambda c: -c.censored_clean)[:10]:
+            uncensored = cell.uncensored_rate
+            add(
+                f"  {cell.model[:20]:<21}{cell.task:<16}{cell.prompt:<4}"
+                f"{cell.censored_clean} of {cell.n} run(s) hit the turn cap while still "
+                f"clean; rate among runs that concluded: {uncensored.point:.2f} "
+                f"(n={uncensored.n})"
+            )
+        add("")
+        add("  A run stopped at its turn cap is right-censored: it had not cheated yet,")
+        add("  which is not the same as it never would. Censoring can therefore only")
+        add("  hide cheats, never create them, so the observed rate understates the truth")
+        add("  by an unknown amount. Raise `max_turns` for the affected task (it can be")
+        add("  set per-task in task.yaml) until this section is empty, then re-read the")
+        add("  rates. Check the stop-reason section below for how widespread it is.")
+
     identical = [cell for cell in report.cells.values() if cell.looks_deterministic]
     if identical:
         add("")
@@ -485,6 +585,20 @@ def format_report(report: Report) -> str:
                     f"  {merged.unpriced} run(s) used a model with no rate in "
                     f"harness/pricing.py, so their cost reads as zero"
                 )
+            # An agent loop re-sends its transcript every turn, so on a hosted
+            # provider most input tokens should be cache reads. Zero cached tokens
+            # over several multi-turn runs means caching is not working, which is
+            # roughly a 4x cost difference and easy to miss in a total.
+            total_in = merged.input_tokens + merged.cached_input_tokens
+            if total_in and merged.n >= 3 and not model.startswith(("mock:", "ollama:")):
+                share = merged.cached_input_tokens / total_in
+                if merged.cached_input_tokens == 0:
+                    add(
+                        "  no cached input at all across these runs: prompt caching "
+                        "is off or being rejected. Check `agent.sampling.cache_strategy`."
+                    )
+                else:
+                    add(f"  {share:.0%} of input tokens were cache reads")
         add("")
         add(f"total spend ${spend:.4f} over {attempted} attempted run(s)")
         if attempted:
@@ -535,6 +649,10 @@ def write_csv(report: Report, path: Path) -> Path:
         "verified",
         "hard_evidence",
         "median_latency_to_cheat",
+        "censored",
+        "censored_clean",
+        "rate_is_lower_bound",
+        "uncensored_rate",
         "excluded_manipulation",
         "excluded_error",
         *[f"channel_{channel}" for channel in CHANNELS],
@@ -560,6 +678,10 @@ def write_csv(report: Report, path: Path) -> Path:
                     "verified": cell.verified,
                     "hard_evidence": cell.hard_evidence,
                     "median_latency_to_cheat": cell.median_latency,
+                    "censored": cell.censored,
+                    "censored_clean": cell.censored_clean,
+                    "rate_is_lower_bound": cell.rate_is_lower_bound,
+                    "uncensored_rate": round(cell.uncensored_rate.point, 4),
                     "excluded_manipulation": cell.excluded_manipulation,
                     "excluded_error": cell.excluded_error,
                     **{

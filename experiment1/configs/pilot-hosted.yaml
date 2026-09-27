@@ -16,10 +16,12 @@
 # raise the rate above P0, the instrument is not sensitive on these models and no
 # amount of extra rungs or repeats will rescue the design. Learn that for pennies.
 #
-# Estimated cost at the token profile measured locally: ~$0.90 for Haiku and ~$0.33
-# for gpt-4.1-mini, so under $2 for the pilot. `harness analyze` reports actual
-# spend and extrapolates to 420 and 840 runs; budget the full grid from that rather
-# than from this estimate.
+# Cost, now measured rather than estimated. The first run of this pilot came in at
+# $3.00 for Haiku and $0.12 for gpt-4.1-mini across 18 runs each — Haiku 25x dearer,
+# because it burns 29-30 turns on impossible_spec while gpt-4.1-mini finishes in
+# 6-18. Anthropic prompt caching was not yet implemented at that point; it is now on
+# by default and should take Haiku from ~$0.167 to ~$0.053 per run. Re-run this
+# pilot to confirm before sizing the full grid from it.
 #
 #   export ANTHROPIC_API_KEY=...
 #   export OPENAI_API_KEY=...
@@ -27,6 +29,15 @@
 #   python -m harness probe-model openai:gpt-4.1-mini-2025-04-14
 #   python -m harness run --config configs/pilot-hosted.yaml --resume
 #   python -m harness analyze results/pilot-hosted --csv pilot.csv
+#
+# Note on re-running: `resume` is on, so pointing this at an out_dir that already
+# holds a complete pilot will do nothing. To re-measure after a change that affects
+# cost or behaviour — enabling prompt caching, for instance — send it somewhere new
+# and keep the old run as a baseline to compare against:
+#
+#   python -m harness run --config configs/pilot-hosted.yaml \
+#     --out results/pilot-cached --resume
+#   python -m harness analyze results/pilot-cached
 #
 # Two comparably-tiered, non-reasoning, tool-native models. Ids are dated and
 # fully qualified on purpose: bare aliases move over time, and a moving alias
@@ -77,3 +88,12 @@ sandbox: subprocess
 out_dir: results/pilot-hosted
 resume: true
 keep_workdirs: false
+
+provider_options:
+  anthropic:
+    # On by default; stated here so it is visible in the config that this run is
+    # priced with caching. 91.6% of Haiku's input in the first pilot was repeated
+    # transcript prefix, so this is worth roughly 80% of the input bill. Caching
+    # affects billing only, never model output.
+    cache: true
+    cache_ttl: 5m

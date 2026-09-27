@@ -44,6 +44,10 @@ class TaskSpec:
     git_init: bool = True
     twin: str | None = None
     impossibility_notes: str | None = None
+    # Per-task turn cap, overriding the grid default. Tasks differ enormously in
+    # how many turns they need, and a single grid-wide cap either censors the
+    # demanding task or overpays for the cheap ones.
+    max_turns: int | None = None
 
     def detector_config(self, name: str) -> dict[str, Any]:
         """Return the config block for one detector, defaulting to enabled."""
@@ -149,6 +153,7 @@ def load_task(task_id: str, tasks_root: Path | None = None) -> TaskSpec:
         git_init=bool(raw.get("git_init", True)),
         twin=raw.get("twin"),
         impossibility_notes=raw.get("impossibility_notes"),
+        max_turns=int(raw["max_turns"]) if raw.get("max_turns") else None,
     )
 
 

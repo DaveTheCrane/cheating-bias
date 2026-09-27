@@ -32,9 +32,11 @@ from harness.models.mock import PERSONALITIES
 from harness.prompts import LADDER, MONITORING, CHANNELS, render
 from harness.runner import (
     RESULTS_FILENAME,
+    archive_results,
     completed_cells,
     iter_cells,
     load_records,
+    provenance_conflicts,
     run_grid,
 )
 from harness.scoring import RunRecord
@@ -84,6 +86,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume",
         action="store_true",
         help="skip cells already recorded in the output directory",
+    )
+    run.add_argument(
+        "--archive",
+        action="store_true",
+        help="move an existing output directory aside with a timestamp before starting",
     )
 
     analyse = sub.add_parser("analyze", help="summarise a results directory")
@@ -227,6 +234,36 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if reply not in ("y", "yes"):
                 return 1
 
+    destination = Path(config.out_dir)
+
+    if args.archive:
+        moved = archive_results(destination)
+        print(f"archived previous results to {moved}" if moved else "nothing to archive")
+
+    # Results are appended, never overwritten, so a stale directory does not lose
+    # data — it silently blends generations instead, which analyze would then pool
+    # into one rate. Catch it before any money is spent.
+    conflicts = provenance_conflicts(
+        destination / RESULTS_FILENAME,
+        {task_id: load_task(task_id) for task_id in config.tasks},
+    )
+    if conflicts:
+        print("\n" + "!" * 70)
+        print("WARNING: this output directory holds runs from a different setup")
+        print("!" * 70)
+        for line in conflicts:
+            print(f"  - {line}")
+        print(
+            "\n  Results append rather than overwrite, so nothing is lost — but mixing\n"
+            "  these into one analysis would pool incomparable runs. Either send this\n"
+            "  run somewhere new with --out, or archive the old one with --archive.\n"
+            "  `analyze` will also flag the mixture if you proceed."
+        )
+        if not args.yes:
+            reply = input("continue anyway? [y/N] ").strip().lower()
+            if reply not in ("y", "yes"):
+                return 1
+
     total = config.run_count
     if config.resume:
         done = completed_cells(Path(config.out_dir) / RESULTS_FILENAME)
@@ -364,6 +401,12 @@ def _cmd_verify_tasks(_args: argparse.Namespace) -> int:
         diff_report = verify.check_twin_minimal_diff(task, twin)
         state = "ok" if diff_report.get("ok") else "FAIL"
         print(f"  {'twin diff':<18} {state:<5} {diff_report.get('line_diffs') or 'no differences'}")
+        if not diff_report.get("turn_budgets_match"):
+            print(
+                f"  {'twin turns':<18} FAIL  max_turns differ "
+                f"{diff_report.get('max_turns')}: an unequal turn budget gives one arm "
+                f"more opportunity to cheat and confounds the contrast"
+            )
         failures += 0 if diff_report.get("ok") else 1
 
     print("\nall checks passed" if not failures else f"\n{failures} check(s) failed")

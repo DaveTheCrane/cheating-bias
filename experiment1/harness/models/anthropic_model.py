@@ -19,7 +19,12 @@ from harness.models.base import (
     ToolCall,
     ToolSchema,
 )
-from harness.models.params import describe, filter_to_signature, unsupported_param
+from harness.models.params import (
+    declared_parameters,
+    describe,
+    filter_to_signature,
+    unsupported_param,
+)
 
 MAX_ATTEMPTS = 5
 BACKOFF_BASE = 2.0
@@ -34,6 +39,8 @@ class AnthropicModel:
         temperature: float = 1.0,
         max_tokens: int = 4096,
         effort: str | None = None,
+        cache: bool = True,
+        cache_ttl: str = "5m",
         client: Any | None = None,
     ) -> None:
         """
@@ -46,6 +53,16 @@ class AnthropicModel:
             effort: Optional ``output_config.effort``, one of low/medium/high/
                 xhigh/max. This is the sampling control that replaced temperature.
                 Left unset by default so the account default applies.
+            cache: Request prompt caching. On by default because an agent loop
+                re-sends its whole transcript every turn: measured over a real
+                pilot, 91.6% of this adapter's input tokens were repeated prefix,
+                and caching cuts input cost by about 80%. Caching does not change
+                model output, only billing. The one case where it loses is a
+                single-turn run, which pays the 1.25x cache-write premium with
+                nothing to reuse — irrelevant here, where runs are 6 to 30 turns.
+            cache_ttl: ``5m`` or ``1h``. 5m is right for an agent loop, whose turns
+                are seconds apart; 1h doubles the write premium to buy persistence
+                nothing here needs.
             client: Injection point for tests.
         """
         self.model = model
@@ -54,8 +71,11 @@ class AnthropicModel:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.effort = effort
+        self.cache = cache
+        self.cache_ttl = cache_ttl
         self._dropped: list[str] = []
         self._sampling: dict[str, Any] = {}
+        self._cache_strategy = "off"
         if client is not None:
             self._client = client
         else:
@@ -70,7 +90,7 @@ class AnthropicModel:
 
     def describe_sampling(self) -> dict[str, Any]:
         """What the provider actually accepted. Recorded with each run."""
-        return dict(self._sampling)
+        return {**self._sampling, "cache_strategy": self._cache_strategy}
 
     # -- translation -------------------------------------------------------
 
@@ -120,6 +140,27 @@ class AnthropicModel:
 
     # -- generation --------------------------------------------------------
 
+    def _cache_param(self) -> dict[str, str]:
+        return {"type": "ephemeral", "ttl": self.cache_ttl}
+
+    def _mark_rolling_breakpoint(self, messages: list[dict[str, Any]]) -> bool:
+        """Put a cache breakpoint on the final content block.
+
+        A breakpoint caches everything up to *and including* the block it sits on,
+        so one marker at the very end of the conversation covers the system prompt,
+        the tool schemas and every prior turn. That is why no separate breakpoint is
+        needed for the static parts, and why a single rolling marker is enough.
+
+        Returns:
+            True if a breakpoint was placed.
+        """
+        for message in reversed(messages):
+            content = message.get("content")
+            if isinstance(content, list) and content and isinstance(content[-1], dict):
+                content[-1]["cache_control"] = self._cache_param()
+                return True
+        return False
+
     def _payload(
         self, system: str, messages: list[Message], tools: list[ToolSchema]
     ) -> dict[str, Any]:
@@ -134,7 +175,41 @@ class AnthropicModel:
             payload["tools"] = self._tools(tools)
         if self.effort:
             payload["output_config"] = {"effort": self.effort}
+
+        if self.cache:
+            # Prefer the top-level parameter this SDK generation exposes: it needs
+            # no breakpoint budgeting and cannot be placed wrongly. Fall back to a
+            # block-level breakpoint on older SDKs, so that an SDK change downgrades
+            # the mechanism rather than silently turning caching off and quadrupling
+            # the bill.
+            if self._accepts_top_level_cache():
+                payload["cache_control"] = self._cache_param()
+                self._cache_strategy = f"top_level:{self.cache_ttl}"
+            elif self._mark_rolling_breakpoint(payload["messages"]):
+                self._cache_strategy = f"rolling_block:{self.cache_ttl}"
+            else:
+                self._cache_strategy = "requested_but_not_applied"
+        else:
+            self._cache_strategy = "off"
+
         return payload
+
+    def _accepts_top_level_cache(self) -> bool:
+        declared = declared_parameters(self._client.messages.create)
+        # None means the signature could not be read, or takes **kwargs; in either
+        # case the top-level parameter is the safer bet.
+        return declared is None or "cache_control" in declared
+
+    def _note_dropped(self, name: str) -> None:
+        """Record a parameter the SDK or provider refused.
+
+        Caching is tracked separately: if ``cache_control`` is rejected the request
+        still succeeds, so without this the run record would keep claiming caching
+        was active while quietly billing every token at full rate.
+        """
+        self._dropped = sorted({*self._dropped, name})
+        if name == "cache_control":
+            self._cache_strategy = "rejected_by_provider"
 
     def generate(
         self,
@@ -149,8 +224,8 @@ class AnthropicModel:
         # against the installed signature keeps the adapter working across SDK
         # versions instead of pinning one.
         payload, dropped = filter_to_signature(self._client.messages.create, payload)
-        if dropped and dropped != self._dropped:
-            self._dropped = dropped
+        for name in dropped:
+            self._note_dropped(name)
         self._sampling = describe(payload, self._dropped)
 
         last_error: Exception | None = None
@@ -163,7 +238,7 @@ class AnthropicModel:
                 name = unsupported_param(exc, set(payload))
                 if name and name in payload:
                     payload.pop(name)
-                    self._dropped = sorted({*self._dropped, name})
+                    self._note_dropped(name)
                     self._sampling = describe(payload, self._dropped)
                     continue
                 return ModelResponse(error=f"{type(exc).__name__}: {exc}")
@@ -171,7 +246,7 @@ class AnthropicModel:
                 name = unsupported_param(exc, set(payload))
                 if name and name in payload:
                     payload.pop(name)
-                    self._dropped = sorted({*self._dropped, name})
+                    self._note_dropped(name)
                     self._sampling = describe(payload, self._dropped)
                     continue
                 last_error = exc

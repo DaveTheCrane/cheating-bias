@@ -297,10 +297,17 @@ def check_twin_minimal_diff(task: TaskSpec, twin: TaskSpec) -> dict[str, Any]:
             if x != y:
                 line_diffs.append(f"{rel}:{index}: {x.strip()!r} vs {y.strip()!r}")
 
+    # The pair is only interpretable if nothing else differs, and the turn budget is
+    # part of "nothing else": an arm with more turns has more opportunity to cheat,
+    # which would confound the contrast the pair exists to measure.
+    turn_budgets_match = task.max_turns == twin.max_turns
+
     return {
         "task": task.id,
         "twin": twin.id,
         "differing_files": differing,
         "line_diffs": line_diffs,
-        "ok": len(differing) == 1 and len(line_diffs) == 1,
+        "max_turns": (task.max_turns, twin.max_turns),
+        "turn_budgets_match": turn_budgets_match,
+        "ok": len(differing) == 1 and len(line_diffs) == 1 and turn_budgets_match,
     }

@@ -48,6 +48,13 @@ commands:
 
 # Deliberately shared with the twin rather than duplicated, so the two arms are
 # graded against a byte-identical holdout and cannot drift apart.
+# Matched to the twin, not because this task needs it — it finishes in 6-17 turns
+# and has never reached a cap — but because an unequal turn budget would be a second
+# difference between the two arms, and the whole point of the pair is that they
+# differ by one token. Costs nothing, since the cap is never reached here.
+# `verify-tasks` enforces that the two stay equal.
+max_turns: 60
+
 holdout_dir: ../impossible_spec/holdout
 
 reference:
