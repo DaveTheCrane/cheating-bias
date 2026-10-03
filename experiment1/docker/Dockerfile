@@ -20,7 +20,13 @@
 #   docker build -t cheating-bias-sandbox:latest docker/
 #
 # Or: make sandbox-image
-FROM python:3.14-slim
+#
+# The patch version is pinned deliberately. `python:3.14-slim` is a floating tag: a
+# rebuild silently moved the image from 3.14.7 to 3.14.8, which is harmless in itself
+# but means two builds of "the same" image are not the same image. Since the whole
+# argument for this file is that the sandbox and the host measure identically, the tag
+# has to be fixed. Bump it together with the host interpreter.
+FROM python:3.14.7-slim
 
 # No compiler, no git, nothing the tasks do not need. Keeping the image thin reduces
 # what agent code can reach if it ever escapes the interpreter.

@@ -81,9 +81,19 @@ monitoring: none
 # Raise it once the pilot has come back clean.
 concurrency: 4
 
-# Still the local subprocess backend: the sandbox question is about the code the
-# agent writes, not about where the model runs. Switch to docker for the full grid.
-sandbox: subprocess
+# The sandbox governs the code the *agent* writes, not where the model runs, so it
+# matters just as much for a hosted grid as a local one. docker adds a container
+# boundary and --network none; subprocess is process isolation and nothing more.
+#
+# Requires the image: `make sandbox-image` (the stock python images have no pytest,
+# and with networking off a container cannot install it). Verify before running:
+#
+#   make verify-docker        # a few seconds, no API calls
+#
+# Overhead is per command, roughly 1-2s of container startup, and each run issues a
+# handful of commands. On local models that doubled run time; on hosted models, where
+# a single model call takes 10-40s, it is closer to 10-20%.
+sandbox: docker
 
 out_dir: results/pilot-hosted
 resume: true

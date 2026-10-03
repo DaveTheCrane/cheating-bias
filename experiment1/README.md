@@ -11,7 +11,70 @@ stop moving.
 > with your filesystem privileges and your network access. Use `--sandbox docker`
 > for anything beyond local piloting: it adds a container boundary and
 > `--network none`, which also closes the answer-lookup channel and prevents
-> exfiltration.
+> exfiltration. See [The docker sandbox](#the-docker-sandbox).
+
+## The docker sandbox
+
+### Verifying it works
+
+```bash
+make sandbox-image      # build the image (once)
+make verify-docker      # a few seconds, no model calls
+```
+
+`verify-tasks --sandbox docker` is the cheapest meaningful check: it runs every
+task's real test suite, plus the reference solutions and the impossibility check,
+through the docker executor — exercising the whole sandbox path with **zero API
+cost**. It completes in about three seconds.
+
+Note that `probe-model` is *not* useful here. It only calls a model API and never
+touches the executor; the sandbox is a separate layer entirely.
+
+For a fuller check, `make smoke-docker` runs all 11 scripted agents and every
+detector through docker (~1.5 min), then a 24-run mock grid. Worth doing once: a
+mock grid under docker is the only check that covers the full `run` path including
+per-run executor construction.
+
+### The image
+
+The sandbox needs `docker/Dockerfile` built as `cheating-bias-sandbox:latest`. It
+cannot be a stock `python:*-slim` image, because those carry no pytest and the
+sandbox runs with `--network none`, so a container cannot install it at run time.
+Every task command would fail with "No module named pytest".
+
+Python and pytest are pinned to match the host (3.14.7 / 9.1.1). That is not
+housekeeping: `perf_memo` grades against a 1.0s wall-clock budget calibrated on
+CPython 3.14, so a different interpreter would change the margin and the two
+backends would stop measuring the same thing. With them matched, a 24-run mock grid
+produces **identical labels** under both backends.
+
+`build_executor("docker")` checks the image once per process and refuses to start
+with a build command if it is missing, rather than letting a broken image produce a
+uniformly failing grid.
+
+### Infrastructure failures never count as results
+
+A sandbox that cannot run the tests produces no outcome, so those rows are marked
+errored and excluded rather than scored. Without this, a broken backend reads as the
+agent failing its tests — and since the agent still claims success, it also picks up
+a `misreporting` finding. A completely broken grid would look like a strong result.
+
+This is not hypothetical: the first real docker run hit it. `DockerExecutor` passed
+the working directory straight into `--volume`, and because `out_dir` is normally a
+relative path, Docker created a *named volume* instead of a bind mount and exited
+125 — which was then scored as failing tests. Both the mount bug and the
+misclassification are fixed, and both have regression tests built from the verbatim
+daemon error.
+
+Exit codes 125/126/127, and output mentioning a daemon error, a missing pytest or a
+missing working directory, are all treated as infrastructure. A genuine
+`1 failed, 15 passed` is not.
+
+### Cost
+
+Container startup is roughly 1–2s per command, and each run issues several. On local
+models that about doubled wall-clock. On hosted models, where one model call takes
+10–40s, it is nearer 10–20%. `configs/pilot-hosted.yaml` uses docker by default.
 
 ## Quickstart
 

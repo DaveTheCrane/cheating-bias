@@ -754,6 +754,125 @@ def _check_anthropic_caching(result: SelfTestResult, conversation: Any, schema: 
     )
 
 
+def _check_sandbox_failure_handling(result: SelfTestResult, scratch: Path) -> None:
+    """A broken sandbox must not look like the agent failing its tests.
+
+    Both guards here come from bugs the first real docker run exposed:
+
+    1. ``DockerExecutor`` passed the working directory straight into ``--volume``.
+       Given a relative path — which is what ``out_dir`` normally produces — Docker
+       creates a *named volume* instead of a bind mount and exits 125.
+    2. That exit was then scored as a failing test suite, so every run came back
+       "did not pass" and the honest scripted agents were credited with
+       misreporting. A completely broken grid read as a result.
+
+    The second is the dangerous one, so it is asserted on the verbatim daemon error.
+    """
+    from harness.verify import evaluate_pytest, infrastructure_error
+
+    @dataclass
+    class FakeResult:
+        command: str
+        returncode: int
+        stdout: str
+        stderr: str
+        duration: float = 0.1
+        timed_out: bool = False
+
+        @property
+        def output(self) -> str:
+            return "\n".join(p for p in (self.stdout, self.stderr) if p)
+
+        def truncated_output(self, limit: int = 6000) -> str:
+            return self.output[:limit]
+
+    daemon_error = (
+        'docker: Error response from daemon: create results/smoke/runs/x/work: '
+        '"results/smoke/runs/x/work" includes invalid characters for a local volume '
+        "name, only \"[a-zA-Z0-9][a-zA-Z0-9_.-]\" are allowed. If you intended to "
+        "pass a host directory, use absolute path"
+    )
+    cases: tuple[tuple[str, FakeResult, bool], ...] = (
+        (
+            "docker refusing a relative bind mount",
+            FakeResult("python -m pytest -q tests/", 125, "", daemon_error),
+            True,
+        ),
+        (
+            "an image without pytest",
+            FakeResult("python -m pytest -q tests/", 1, "", "No module named pytest"),
+            True,
+        ),
+        (
+            "a missing working directory",
+            FakeResult("python -m pytest", 125, "", "working directory does not exist: /nope"),
+            True,
+        ),
+        (
+            "a genuine test failure",
+            FakeResult(
+                "python -m pytest -q tests/",
+                1,
+                "F...\n1 failed, 15 passed in 6.62s",
+                "",
+            ),
+            False,
+        ),
+        (
+            "a genuine pass",
+            FakeResult("python -m pytest -q tests/", 0, "16 passed in 0.10s", ""),
+            False,
+        ),
+    )
+
+    for label, fake, expected in cases:
+        detected = infrastructure_error(fake) is not None
+        result.record(
+            detected == expected,
+            f"sandbox failure: {label} classified as "
+            f"{'infrastructure' if expected else 'the agent'}",
+            f"infrastructure_error={infrastructure_error(fake)!r}",
+        )
+        verdict = evaluate_pytest(fake)
+        result.record(
+            bool(verdict.get("infrastructure_error")) == expected,
+            f"sandbox failure: {label} propagates into the verdict",
+            f"verdict={verdict.get('infrastructure_error')!r}",
+        )
+        if expected:
+            result.record(
+                verdict.get("passed") is False,
+                f"sandbox failure: {label} never counts as a pass",
+                f"passed={verdict.get('passed')}",
+            )
+
+    # The relative-path fix itself needs docker, so it is checked only when present.
+    if shutil.which("docker") is None:
+        result.lines.append("  (docker not installed; skipped the live bind-mount check)")
+        return
+
+    from harness.executor import DockerExecutor, check_sandbox_image
+
+    if check_sandbox_image() is not None:
+        result.lines.append("  (sandbox image not built; skipped the live bind-mount check)")
+        return
+
+    relative = Path("results") / "_selftest_mount"
+    relative.mkdir(parents=True, exist_ok=True)
+    try:
+        (relative / "probe.py").write_text("print('mounted')\n", encoding="utf-8")
+        outcome = DockerExecutor(check_image=False).run(
+            ["python", "probe.py"], cwd=relative, timeout=90
+        )
+        result.record(
+            outcome.returncode == 0 and "mounted" in outcome.output,
+            "sandbox: a relative working directory is bind-mounted, not made a volume",
+            f"rc={outcome.returncode} output={outcome.output.strip()[:160]!r}",
+        )
+    finally:
+        shutil.rmtree(relative, ignore_errors=True)
+
+
 def _check_results_accumulation(result: SelfTestResult, scratch: Path) -> None:
     """Results must accumulate without silently blending incompatible generations.
 
@@ -1228,6 +1347,7 @@ def run_selftest(
         _check_manipulation_check(result)
         _check_censoring(result)
         _check_results_accumulation(result, scratch)
+        _check_sandbox_failure_handling(result, scratch)
         _check_hosted_adapters(result)
         _check_ollama_adapter(result)
         _check_tasks(result, scratch, sandbox)
